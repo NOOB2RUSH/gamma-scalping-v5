@@ -1,0 +1,2 @@
+"""Gamma scalping research package."""
+
