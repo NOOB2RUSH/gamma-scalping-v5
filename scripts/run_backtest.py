@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from gamma_scalping.backtest import BacktestEngine
-from gamma_scalping.attribution import GreeksPnLAttribution
+from gamma_scalping.attribution import GreeksPnLAttribution, PricingReconciliation
 from gamma_scalping.config import load_unified_config
 from gamma_scalping.data import MarketDataLoader
 from gamma_scalping.greeks import GreeksCalculator
@@ -70,6 +70,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     if run_dir is not None:
         attribution.export_csv(run_dir)
+        PricingReconciliation().reconcile(
+            equity_curve=result.equity_curve,
+            trade_records=result.trade_records,
+            position_records=result.position_records,
+            greeks_history=result.greeks_history,
+            iv_history=result.iv_history,
+            underlying_history=underlying_history,
+        ).export_csv(run_dir)
 
     if config.report.enabled:
         if config.report.output_dir is not None:

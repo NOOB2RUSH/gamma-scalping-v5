@@ -280,6 +280,11 @@ class BacktestEngine:
     def _greeks_history_rows(snapshot: MarketSnapshot, greeks: pd.DataFrame) -> list[dict[str, object]]:
         columns = [
             "contract_id",
+            "option_type",
+            "strike",
+            "ttm_trading_days",
+            "multiplier",
+            "theoretical_price",
             "delta",
             "gamma",
             "theta",

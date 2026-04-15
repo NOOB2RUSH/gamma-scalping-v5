@@ -5,7 +5,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from gamma_scalping.attribution import AttributionConfig, GreeksPnLAttribution
+from gamma_scalping.attribution import AttributionConfig, GreeksPnLAttribution, PricingReconciliation
 
 
 def _base_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -288,6 +288,29 @@ def test_attribution_result_exports_csv(tmp_path) -> None:
     assert paths["greeks_attribution_by_episode"].exists()
     assert paths["greeks_attribution_cumulative"].exists()
     assert paths["attribution_quality"].exists()
+
+
+def test_pricing_reconciliation_splits_mark_and_greeks_residual(tmp_path) -> None:
+    equity_curve, trade_records, position_records, greeks_history, iv_history, underlying_history = _base_inputs()
+
+    result = PricingReconciliation().reconcile(
+        equity_curve=equity_curve,
+        trade_records=trade_records,
+        position_records=position_records,
+        greeks_history=greeks_history,
+        iv_history=iv_history,
+        underlying_history=underlying_history,
+    )
+
+    assert not result.detail.empty
+    assert not result.daily.empty
+    assert {"mark_pnl", "greeks_explained_pnl", "mark_residual_pnl", "execution_vs_mark_pnl"}.issubset(
+        result.detail.columns
+    )
+    assert result.daily["detail_count"].sum() > 0
+    paths = result.export_csv(tmp_path)
+    assert paths["pricing_reconciliation"].exists()
+    assert paths["pricing_reconciliation_daily"].exists()
 
 
 def test_unsupported_exposure_mode_fails_fast() -> None:

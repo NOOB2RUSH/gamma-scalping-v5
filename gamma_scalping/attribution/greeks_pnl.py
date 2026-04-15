@@ -223,6 +223,7 @@ class GreeksPnLAttribution:
         prev_positions = positions_by_date.get(prev_date, pd.DataFrame())
         trades = trades_by_date.get(trading_date, pd.DataFrame())
         episode_ids = sorted(_episode_ids(prev_positions, trades))
+        calendar_gap = (trading_date - prev_date).days  # Bug 1: scale theta by calendar gap
         rows = []
         for episode_id in episode_ids:
             flags: list[str] = []
@@ -231,9 +232,13 @@ class GreeksPnLAttribution:
             episode_positions = _filter_episode(prev_positions, episode_id)
             option_positions = _option_positions(episode_positions)
             etf_positions = _etf_positions(episode_positions)
-            exposures, missing_greeks_count = _option_exposures(option_positions, prev_date, greeks_by_key)
+            exposures, missing_greeks_count, expired_count = _option_exposures(
+                option_positions, prev_date, greeks_by_key, trading_date=trading_date,
+            )
             if missing_greeks_count:
                 flags.append("missing_greeks")
+            if expired_count:
+                flags.append("option_expired")
             iv_state = _vega_and_iv_change(option_positions, prev_date, trading_date, greeks_by_key, iv_by_key)
             if iv_state["missing_iv_count"]:
                 flags.append("missing_iv")
@@ -241,7 +246,7 @@ class GreeksPnLAttribution:
                 flags.append("failed_iv")
             delta_pnl = exposures["delta"] * d_spot
             gamma_pnl = 0.5 * exposures["gamma"] * d_spot * d_spot
-            theta_pnl = exposures["theta"]
+            theta_pnl = exposures["theta"] * calendar_gap
             vega_pnl = iv_state["vega_pnl"]
             hedge_pnl = _hedge_pnl(etf_positions, d_spot)
             cost_pnl = -_trade_fees(_filter_episode(trades, episode_id))
@@ -297,9 +302,13 @@ class GreeksPnLAttribution:
         etf_positions = _etf_positions(prev_positions)
         option_position_count = int(len(option_positions))
 
-        exposures, missing_greeks_count = _option_exposures(option_positions, prev_date, greeks_by_key)
+        exposures, missing_greeks_count, expired_count = _option_exposures(
+            option_positions, prev_date, greeks_by_key, trading_date=trading_date,
+        )
         if missing_greeks_count:
             flags.append("missing_greeks")
+        if expired_count:
+            flags.append("option_expired")
 
         iv_state = _vega_and_iv_change(option_positions, prev_date, trading_date, greeks_by_key, iv_by_key)
         if iv_state["missing_iv_count"]:
@@ -307,9 +316,10 @@ class GreeksPnLAttribution:
         if iv_state["failed_iv_count"]:
             flags.append("failed_iv")
 
+        calendar_gap = (trading_date - prev_date).days  # Bug 1: scale theta by calendar gap
         delta_pnl = exposures["delta"] * d_spot
         gamma_pnl = 0.5 * exposures["gamma"] * d_spot * d_spot
-        theta_pnl = exposures["theta"]
+        theta_pnl = exposures["theta"] * calendar_gap
         vega_pnl = iv_state["vega_pnl"]
         hedge_pnl = _hedge_pnl(etf_positions, d_spot)
         cost_pnl = -_trade_fees(trades_by_date.get(trading_date, pd.DataFrame()))
@@ -456,9 +466,18 @@ def _option_exposures(
     option_positions: pd.DataFrame,
     prev_date: object,
     greeks_by_key: pd.DataFrame,
-) -> tuple[dict[str, float], int]:
+    trading_date: object | None = None,
+) -> tuple[dict[str, float], int, int]:
+    """Compute portfolio greeks exposures from prev_date's positions.
+
+    Returns (exposures, missing_greeks_count, expired_count).
+    For contracts that expired between prev_date and trading_date,
+    gamma and vega are excluded (undefined at expiry) while delta
+    and theta are kept as first-order approximations.
+    """
     exposures = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
     missing_greeks_count = 0
+    expired_count = 0
     for _, position in option_positions.iterrows():
         contract_id = str(position["instrument_id"])
         if (prev_date, contract_id) not in greeks_by_key.index:
@@ -466,16 +485,36 @@ def _option_exposures(
             continue
         greek = greeks_by_key.loc[(prev_date, contract_id)]
         scale = float(position["quantity"]) * float(position["multiplier"])
+
+        # Detect if contract expired between prev_date and trading_date
+        is_expired = False
+        if trading_date is not None:
+            if (trading_date, contract_id) in greeks_by_key.index:
+                td_delta = pd.to_numeric(
+                    greeks_by_key.loc[(trading_date, contract_id)].get("delta"),
+                    errors="coerce",
+                )
+                if pd.isna(td_delta):
+                    is_expired = True
+            else:
+                # Contract has no greeks entry on trading_date — likely expired
+                is_expired = True
+        if is_expired:
+            expired_count += 1
+
         missing_required = False
         for key in exposures:
             value = pd.to_numeric(greek.get(key), errors="coerce")
             if pd.isna(value):
                 missing_required = True
                 continue
+            # Gamma and vega are undefined for expired contracts
+            if is_expired and key in ("gamma", "vega"):
+                continue
             exposures[key] += float(value) * scale
         if missing_required:
             missing_greeks_count += 1
-    return exposures, missing_greeks_count
+    return exposures, missing_greeks_count, expired_count
 
 
 def _vega_and_iv_change(
@@ -499,6 +538,11 @@ def _vega_and_iv_change(
         vega = pd.to_numeric(greek.get("vega"), errors="coerce")
         if pd.isna(vega):
             continue
+
+        # Skip expired contracts — vega is undefined at expiry
+        if _is_contract_expired(contract_id, trading_date, greeks_by_key):
+            continue
+
         position_vega = float(vega) * float(position["quantity"]) * float(position["multiplier"])
 
         if (prev_date, contract_id) not in iv_by_key.index or (trading_date, contract_id) not in iv_by_key.index:
@@ -531,6 +575,22 @@ def _vega_and_iv_change(
 def _iv_failed(row: pd.Series) -> bool:
     status = str(row.get("iv_status", "ok")).lower()
     return status not in {"", "ok", "valid"}
+
+
+def _is_contract_expired(
+    contract_id: str,
+    trading_date: object,
+    greeks_by_key: pd.DataFrame,
+) -> bool:
+    """Check if a contract has expired by trading_date (greeks became NaN)."""
+    if (trading_date, contract_id) in greeks_by_key.index:
+        td_delta = pd.to_numeric(
+            greeks_by_key.loc[(trading_date, contract_id)].get("delta"),
+            errors="coerce",
+        )
+        return pd.isna(td_delta)
+    # No entry at all on trading_date also indicates expiry
+    return True
 
 
 def _hedge_pnl(etf_positions: pd.DataFrame, d_spot: float) -> float:
