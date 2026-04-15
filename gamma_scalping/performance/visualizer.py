@@ -9,17 +9,27 @@ import pandas as pd
 
 
 class Visualizer:
-    def plot_equity_curve(self, result: Any):
+    def __init__(self, matplotlib_config_dir: Path | str | None = None) -> None:
+        self.matplotlib_config_dir = None if matplotlib_config_dir is None else str(matplotlib_config_dir)
+
+    def plot_equity_curve(self, result: Any, underlying_history: pd.DataFrame | None = None):
         frame = _as_frame(result, "equity_curve")
         frame = _date_sorted(frame)
         if "equity" not in frame.columns:
             raise ValueError("equity curve frame must contain an 'equity' column")
-        plt = _pyplot()
+        equity = pd.to_numeric(frame["equity"], errors="coerce")
+        strategy_return = equity / equity.dropna().iloc[0] - 1.0
+        plt = _pyplot(self.matplotlib_config_dir)
+        percent_formatter = _percent_formatter(plt)
         fig, ax = plt.subplots(figsize=(9, 4.5))
-        ax.plot(frame["trading_date"], pd.to_numeric(frame["equity"], errors="coerce"), label="equity")
-        ax.set_title("Equity Curve")
+        ax.plot(frame["trading_date"], strategy_return, label="strategy")
+        underlying = _normalized_underlying_return(underlying_history)
+        if underlying is not None:
+            ax.plot(underlying["trading_date"], underlying["return"], label="50ETF")
+        ax.set_title("Strategy vs 50ETF")
         ax.set_xlabel("Trading Date")
-        ax.set_ylabel("Equity")
+        ax.set_ylabel("Cumulative Return")
+        ax.yaxis.set_major_formatter(percent_formatter)
         ax.grid(True, alpha=0.3)
         ax.legend()
         fig.autofmt_xdate()
@@ -33,7 +43,7 @@ class Visualizer:
             raise ValueError("equity curve frame must contain an 'equity' column")
         equity = pd.to_numeric(frame["equity"], errors="coerce")
         drawdown = equity / equity.cummax() - 1.0
-        plt = _pyplot()
+        plt = _pyplot(self.matplotlib_config_dir)
         fig, ax = plt.subplots(figsize=(9, 4.5))
         ax.fill_between(frame["trading_date"], drawdown, 0.0, alpha=0.35)
         ax.set_title("Drawdown")
@@ -50,7 +60,7 @@ class Visualizer:
         columns = [column for column in ["atm_iv", "hv_10", "hv_20", "hv_60", "iv_hv_spread", "hv_iv_edge"] if column in frame]
         if not columns:
             raise ValueError("volatility frame must contain at least one supported volatility column")
-        plt = _pyplot()
+        plt = _pyplot(self.matplotlib_config_dir)
         fig, ax = plt.subplots(figsize=(10, 5))
         for column in columns:
             ax.plot(frame["trading_date"], pd.to_numeric(frame[column], errors="coerce"), label=column)
@@ -73,7 +83,7 @@ class Visualizer:
         ]
         if not columns:
             raise ValueError("attribution daily frame must contain PnL component columns")
-        plt = _pyplot()
+        plt = _pyplot(self.matplotlib_config_dir)
         fig, ax = plt.subplots(figsize=(10, 5))
         bottom_pos = np.zeros(len(frame))
         bottom_neg = np.zeros(len(frame))
@@ -98,7 +108,7 @@ class Visualizer:
         columns = [column for column in ["cum_delta_pnl", "cum_gamma_pnl", "cum_theta_pnl", "cum_vega_pnl"] if column in frame]
         if not columns:
             raise ValueError("attribution cumulative frame must contain cumulative Greeks PnL columns")
-        plt = _pyplot()
+        plt = _pyplot(self.matplotlib_config_dir)
         fig, ax = plt.subplots(figsize=(10, 5))
         for column in columns:
             ax.plot(frame["trading_date"], pd.to_numeric(frame[column], errors="coerce"), label=column)
@@ -115,12 +125,13 @@ class Visualizer:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(path, dpi=150)
-        _pyplot().close(figure)
+        _pyplot(self.matplotlib_config_dir).close(figure)
         return path
 
 
-def _pyplot():
-    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+def _pyplot(matplotlib_config_dir: str | None = None):
+    if matplotlib_config_dir:
+        os.environ.setdefault("MPLCONFIGDIR", matplotlib_config_dir)
     import matplotlib
 
     matplotlib.use("Agg", force=True)
@@ -146,3 +157,21 @@ def _date_sorted(frame: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("frame must contain a 'trading_date' column")
     frame["trading_date"] = pd.to_datetime(frame["trading_date"])
     return frame.sort_values("trading_date").reset_index(drop=True)
+
+
+def _normalized_underlying_return(frame: pd.DataFrame | None) -> pd.DataFrame | None:
+    if frame is None or frame.empty or "close" not in frame.columns:
+        return None
+    normalized = _date_sorted(frame)
+    close = pd.to_numeric(normalized["close"], errors="coerce")
+    valid = close.dropna()
+    if valid.empty:
+        return None
+    normalized["return"] = close / valid.iloc[0] - 1.0
+    return normalized[["trading_date", "return"]]
+
+
+def _percent_formatter(plt: Any):
+    import matplotlib.ticker as mtick
+
+    return mtick.PercentFormatter(xmax=1.0)

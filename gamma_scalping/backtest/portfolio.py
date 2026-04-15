@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Hashable
 
 import pandas as pd
 
+from gamma_scalping.backtest.contract_name import option_contract_name
 from gamma_scalping.backtest.execution import Fill
 from gamma_scalping.data.models import MarketSnapshot
 from gamma_scalping.strategy import PortfolioState, StrategyPosition
@@ -19,13 +21,20 @@ class Holding:
     role: str = ""
     strategy_tag: str = "gamma_scalping"
     entry_trading_date: object | None = None
+    episode_id: str = ""
 
 
 class Portfolio:
-    def __init__(self, initial_cash: float, strategy_tag: str = "gamma_scalping") -> None:
+    def __init__(
+        self,
+        initial_cash: float,
+        strategy_tag: str = "gamma_scalping",
+        position_zero_tolerance: float = 1e-12,
+    ) -> None:
         self.cash = float(initial_cash)
         self.strategy_tag = strategy_tag
-        self.holdings: dict[str, Holding] = {}
+        self.position_zero_tolerance = position_zero_tolerance
+        self.holdings: dict[Hashable, Holding] = {}
         self.cumulative_fee = 0.0
         self.realized_pnl = 0.0
 
@@ -41,6 +50,7 @@ class Portfolio:
                     strategy_tag=holding.strategy_tag,
                     role=holding.role,
                     entry_trading_date=holding.entry_trading_date,
+                    episode_id=holding.episode_id,
                 )
                 for holding in self.holdings.values()
                 if holding.quantity != 0
@@ -58,12 +68,12 @@ class Portfolio:
     def handle_expiry_and_settlement(self, snapshot: MarketSnapshot) -> list[dict[str, object]]:
         option_frame = snapshot.option_chain.frame.set_index("contract_id")
         events = []
-        for instrument_id, holding in list(self.holdings.items()):
+        for key, holding in list(self.holdings.items()):
             if holding.instrument_type != "option" or holding.quantity == 0:
                 continue
-            if instrument_id not in option_frame.index:
+            if holding.instrument_id not in option_frame.index:
                 continue
-            row = option_frame.loc[instrument_id]
+            row = option_frame.loc[holding.instrument_id]
             if int(row.get("ttm_trading_days", 1)) > 0:
                 continue
             payoff = self._option_payoff(row, snapshot.etf_bar.close) * holding.multiplier * holding.quantity
@@ -72,12 +82,13 @@ class Portfolio:
             events.append(
                 {
                     "trading_date": snapshot.trading_date,
-                    "instrument_id": instrument_id,
+                    "instrument_id": holding.instrument_id,
+                    "episode_id": holding.episode_id,
                     "event": "expiry_settlement",
                     "cash_flow": payoff,
                 }
             )
-            del self.holdings[instrument_id]
+            del self.holdings[key]
         return events
 
     def market_value(self, snapshot: MarketSnapshot) -> float:
@@ -114,6 +125,7 @@ class Portfolio:
                 {
                     "trading_date": snapshot.trading_date,
                     "instrument_id": "",
+                    "option_contract_name": "",
                     "instrument_type": "",
                     "quantity": 0.0,
                     "avg_price": 0.0,
@@ -127,6 +139,7 @@ class Portfolio:
                     "role": "",
                     "strategy_tag": self.strategy_tag,
                     "entry_trading_date": "",
+                    "episode_id": "",
                 }
             ]
 
@@ -134,11 +147,12 @@ class Portfolio:
         return [self._position_record(holding, snapshot, option_frame) for holding in self.holdings.values()]
 
     def _update_holding(self, fill: Fill, signed_quantity: float) -> None:
-        current = self.holdings.get(fill.instrument_id)
+        key = self._holding_key(fill.instrument_id, fill.episode_id)
+        current = self.holdings.get(key)
         if current is None:
             if signed_quantity == 0:
                 return
-            self.holdings[fill.instrument_id] = Holding(
+            self.holdings[key] = Holding(
                 instrument_id=fill.instrument_id,
                 instrument_type=fill.instrument_type,
                 quantity=signed_quantity,
@@ -147,6 +161,7 @@ class Portfolio:
                 role=fill.role,
                 strategy_tag=self.strategy_tag,
                 entry_trading_date=fill.trading_date,
+                episode_id=fill.episode_id,
             )
             return
 
@@ -162,8 +177,8 @@ class Portfolio:
                 current.avg_price = fill.price
 
         current.quantity = new_quantity
-        if abs(current.quantity) < 1e-12:
-            del self.holdings[fill.instrument_id]
+        if abs(current.quantity) < self.position_zero_tolerance:
+            del self.holdings[key]
 
     @staticmethod
     def _option_payoff(row: pd.Series, spot: float) -> float:
@@ -182,9 +197,11 @@ class Portfolio:
         market_value = holding.quantity * mark_price * holding.multiplier
         liquidation_value = holding.quantity * liquidation_price * holding.multiplier
         cost_basis_value = holding.quantity * holding.avg_price * holding.multiplier
+        option_row = option_frame.loc[holding.instrument_id] if holding.instrument_id in option_frame.index else None
         return {
             "trading_date": snapshot.trading_date,
             "instrument_id": holding.instrument_id,
+            "option_contract_name": option_contract_name(option_row, snapshot.underlying),
             "instrument_type": holding.instrument_type,
             "quantity": holding.quantity,
             "avg_price": holding.avg_price,
@@ -198,6 +215,7 @@ class Portfolio:
             "role": holding.role,
             "strategy_tag": holding.strategy_tag,
             "entry_trading_date": holding.entry_trading_date,
+            "episode_id": holding.episode_id,
         }
 
     def _mark_price(self, holding: Holding, snapshot: MarketSnapshot, option_frame: pd.DataFrame) -> float:
@@ -220,3 +238,7 @@ class Portfolio:
         else:
             price = row.get("buy_price", row.get("ask", row.get("mark_price", row.get("last", 0.0))))
         return 0.0 if pd.isna(price) else float(price)
+
+    @staticmethod
+    def _holding_key(instrument_id: str, episode_id: str = "") -> Hashable:
+        return (instrument_id, episode_id) if episode_id else instrument_id

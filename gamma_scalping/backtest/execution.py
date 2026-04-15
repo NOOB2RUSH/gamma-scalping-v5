@@ -20,6 +20,7 @@ class Fill:
     fee: float
     reason: str
     role: str = ""
+    episode_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,7 @@ class ExecutionModel:
                     fee=float(fee),
                     reason=order.reason,
                     role=order.role,
+                    episode_id=order.episode_id,
                 )
             )
         return tuple(fills)

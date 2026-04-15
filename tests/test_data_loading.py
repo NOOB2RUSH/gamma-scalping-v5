@@ -8,10 +8,17 @@ import pytest
 from gamma_scalping.data import MarketDataConfig, MarketDataLoader, TradingCalendar
 
 
-def _write_fixture_files(root, trading_date: str, *, invalid_bid_ask: bool = False) -> None:
+def _write_fixture_files(
+    root,
+    trading_date: str,
+    *,
+    invalid_bid_ask: bool = False,
+    etf_subdir: str = "etf",
+    opt_subdir: str = "opt",
+) -> None:
     underlying = "510050.XSHG"
-    etf_dir = root / "etf"
-    opt_dir = root / "opt"
+    etf_dir = root / etf_subdir
+    opt_dir = root / opt_subdir
     etf_dir.mkdir(parents=True, exist_ok=True)
     opt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -70,6 +77,35 @@ def test_loader_standardizes_snapshot_and_ttm(tmp_path) -> None:
     assert chain.loc[0, "sell_price"] == pytest.approx(0.12)
     assert chain.loc[0, "mark_price"] == pytest.approx(0.13)
     assert chain.loc[0, "ttm_trading_days"] == 2
+
+
+def test_loader_uses_configured_data_subdirs_and_cache_size(tmp_path, monkeypatch) -> None:
+    _write_fixture_files(tmp_path, "2024-04-08", etf_subdir="custom_etf", opt_subdir="custom_opt")
+    loader = MarketDataLoader(
+        MarketDataConfig(
+            data_root=tmp_path,
+            etf_subdir="custom_etf",
+            opt_subdir="custom_opt",
+            start_date="2024-04-08",
+            end_date="2024-04-08",
+            parquet_cache_size=0,
+        )
+    )
+    original_read_parquet = pd.read_parquet
+    calls = 0
+
+    def counted_read_parquet(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_read_parquet(*args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_parquet", counted_read_parquet)
+
+    assert loader.list_trading_dates() == [date(2024, 4, 8)]
+    loader.load_etf_bar(date(2024, 4, 8))
+    loader.load_etf_bar(date(2024, 4, 8))
+
+    assert calls == 2
 
 
 def test_loader_falls_back_to_close_for_invalid_bid_ask(tmp_path) -> None:

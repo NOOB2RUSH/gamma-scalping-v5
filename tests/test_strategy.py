@@ -106,13 +106,20 @@ def _without_same_strike_pair() -> pd.DataFrame:
 
 
 def _vol_signal(hv_iv_edge: float = 0.0) -> VolatilitySignal:
+    hv_20 = 0.2 + hv_iv_edge
     return VolatilitySignal(
         trading_date=date(2024, 4, 8),
         underlying="510050.XSHG",
         atm_iv=0.2,
-        hv_20=0.2 + hv_iv_edge,
+        hv_20=hv_20,
         iv_hv_spread=-hv_iv_edge,
         hv_iv_edge=hv_iv_edge,
+        rv_reference=hv_20,
+        rv_reference_source="current_hv:hv_20",
+        rv_reference_status="ok",
+        rv_observation_count=20,
+        rv_iv_edge=hv_iv_edge,
+        iv_rv_ratio=0.2 / hv_20,
         atm_iv_contract_count=2,
         atm_iv_contract_ids=("CALL_ATM", "PUT_ATM"),
         atm_iv_maturities=(date(2024, 4, 22),),
@@ -139,6 +146,12 @@ def test_strategy_opens_atm_straddle_and_initial_hedge() -> None:
     assert decision.order_intents[2].side == "sell"
     assert decision.order_intents[2].quantity == pytest.approx(20000.0)
     assert decision.order_intents[2].role == "hedge"
+    assert decision.episode_id == "gamma_scalping:20240408:CALL_ATM:PUT_ATM"
+    assert decision.entry_atm_iv == pytest.approx(0.2)
+    assert decision.entry_edge == pytest.approx(0.0)
+    assert decision.entry_ratio == pytest.approx(1.0)
+    assert decision.rv_reference_source == "current_hv:hv_20"
+    assert all(order.episode_id == decision.episode_id for order in decision.order_intents)
 
 
 def test_strategy_does_not_open_when_budget_is_insufficient() -> None:
@@ -195,6 +208,25 @@ def test_strategy_existing_position_only_hedges_not_reopen() -> None:
     assert decision.order_intents[0].side == "sell"
 
 
+def test_strategy_hedges_existing_episode_with_same_episode_id() -> None:
+    strategy = GammaScalpingStrategy(StrategyConfig(delta_threshold_pct=0.001))
+    episode_id = "gamma_scalping:20240408:CALL_ATM:PUT_ATM"
+    portfolio = PortfolioState(
+        equity=100000,
+        positions=(
+            StrategyPosition("CALL_ATM", "option", quantity=1, multiplier=10000, role="call_leg", episode_id=episode_id),
+            StrategyPosition("PUT_ATM", "option", quantity=1, multiplier=10000, role="put_leg", episode_id=episode_id),
+            StrategyPosition("510050.XSHG", "etf", quantity=0, role="hedge", episode_id=episode_id),
+        ),
+    )
+
+    decision = strategy.on_snapshot(_snapshot(), _greeks_frame(), _vol_signal(), portfolio)
+
+    assert decision.action == "hedge"
+    assert decision.episode_id == episode_id
+    assert decision.order_intents[0].episode_id == episode_id
+
+
 def test_strategy_holds_when_delta_is_within_threshold() -> None:
     strategy = GammaScalpingStrategy(StrategyConfig(delta_threshold_pct=0.1))
     portfolio = PortfolioState(
@@ -240,3 +272,55 @@ def test_strategy_vol_filter_placeholder_can_block_entry() -> None:
 
     assert decision.action == "hold"
     assert decision.risk_flags == ("vol_filter",)
+
+
+def test_strategy_vol_filter_requires_ratio_and_status() -> None:
+    strategy = GammaScalpingStrategy(
+        StrategyConfig(use_vol_filter=True, min_hv_iv_edge=0.01, entry_max_iv_rv_ratio=0.9)
+    )
+
+    ratio_blocked = strategy.on_snapshot(
+        _snapshot(),
+        _greeks_frame(),
+        _vol_signal(hv_iv_edge=0.02),
+        PortfolioState(100000),
+    )
+
+    assert ratio_blocked.action == "hold"
+    assert ratio_blocked.reason == "vol_filter_not_satisfied"
+
+    signal = _vol_signal(hv_iv_edge=0.05)
+    bad_status = VolatilitySignal(
+        **{**signal.__dict__, "rv_reference_status": "insufficient_history", "rv_iv_edge": 0.05, "iv_rv_ratio": 0.8}
+    )
+    status_blocked = strategy.on_snapshot(_snapshot(), _greeks_frame(), bad_status, PortfolioState(100000))
+
+    assert status_blocked.action == "hold"
+    assert status_blocked.risk_flags == ("vol_filter",)
+
+
+def test_strategy_closes_when_vol_edge_is_filled_before_hedging() -> None:
+    episode_id = "gamma_scalping:20240408:CALL_ATM:PUT_ATM"
+    strategy = GammaScalpingStrategy(
+        StrategyConfig(exit_on_vol_edge_filled=True, exit_min_iv_rv_ratio=1.0, delta_threshold_pct=0.001)
+    )
+    greeks = _greeks_frame()
+    greeks.loc[greeks["contract_id"].isin(["CALL_ATM", "PUT_ATM"]), "iv"] = [0.25, 0.27]
+    portfolio = PortfolioState(
+        equity=100000,
+        positions=(
+            StrategyPosition("CALL_ATM", "option", quantity=1, multiplier=10000, role="call_leg", episode_id=episode_id),
+            StrategyPosition("PUT_ATM", "option", quantity=1, multiplier=10000, role="put_leg", episode_id=episode_id),
+            StrategyPosition("510050.XSHG", "etf", quantity=-100, role="hedge", episode_id=episode_id),
+        ),
+    )
+    signal = _vol_signal(hv_iv_edge=0.04)
+
+    decision = strategy.on_snapshot(_snapshot(), greeks, signal, portfolio)
+
+    assert decision.action == "close"
+    assert decision.reason == "exit_vol_edge_filled"
+    assert decision.risk_flags == ("vol_edge_filled",)
+    assert [order.instrument_type for order in decision.order_intents] == ["option", "option", "etf"]
+    assert decision.entry_edge == pytest.approx(-0.02)
+    assert decision.entry_ratio == pytest.approx(0.26 / 0.24)

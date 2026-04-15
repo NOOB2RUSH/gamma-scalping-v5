@@ -14,6 +14,8 @@ from gamma_scalping.data.models import MarketSnapshot
 from gamma_scalping.utils import row_for_date
 
 Aggregation = Literal["mean", "median"]
+RvReferenceMode = Literal["current_hv", "rolling_quantile", "rolling_median", "max_current_and_quantile"]
+VolFilterCalibrationMode = Literal["walk_forward", "full_sample_calibration"]
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,16 @@ class VolatilityConfig:
     iv_price_column: str = "mid"
     iv_fallback_price_column: str = "last"
     iv_backend: Literal["py_vollib_vectorized"] = "py_vollib_vectorized"
+    iv_bisection_lower: float = 0.0001
+    iv_bisection_upper: float = 5.0
+    iv_bisection_tolerance: float = 1e-8
+    iv_bisection_max_iterations: int = 100
+    vol_filter_calibration_mode: VolFilterCalibrationMode = "walk_forward"
+    rv_reference_mode: RvReferenceMode = "current_hv"
+    rv_reference_hv_column: str = "hv_20"
+    rv_distribution_lookback_days: int = 252
+    rv_distribution_min_observations: int = 60
+    rv_distribution_quantile: float = 0.50
 
 
 @dataclass(frozen=True)
@@ -57,6 +69,12 @@ class VolatilitySignal:
     hv_20: float
     iv_hv_spread: float
     hv_iv_edge: float
+    rv_reference: float
+    rv_reference_source: str
+    rv_reference_status: str
+    rv_observation_count: int
+    rv_iv_edge: float
+    iv_rv_ratio: float
     atm_iv_contract_count: int
     atm_iv_contract_ids: tuple[str, ...]
     atm_iv_maturities: tuple[date, ...]
@@ -176,10 +194,18 @@ class VolatilityEngine:
         *,
         trading_date: date,
         underlying: str,
+        hv_history: pd.DataFrame | None = None,
     ) -> VolatilitySignal:
         atm = self.atm_iv(surface, atm_config)
         hv_20 = float(hv_state.get("hv_20", np.nan))
         iv_hv_spread = atm.atm_iv - hv_20 if not (math.isnan(atm.atm_iv) or math.isnan(hv_20)) else np.nan
+        rv_reference, rv_source, rv_status, rv_count = self._rv_reference(
+            hv_state,
+            hv_history=hv_history,
+            trading_date=trading_date,
+        )
+        rv_iv_edge = rv_reference - atm.atm_iv if _is_positive(rv_reference) and _is_positive(atm.atm_iv) else np.nan
+        iv_rv_ratio = atm.atm_iv / rv_reference if _is_positive(rv_reference) and _is_positive(atm.atm_iv) else np.nan
         status_summary = surface["iv_status"].value_counts(dropna=False).to_dict()
         return VolatilitySignal(
             trading_date=trading_date,
@@ -188,6 +214,12 @@ class VolatilityEngine:
             hv_20=hv_20,
             iv_hv_spread=iv_hv_spread,
             hv_iv_edge=-iv_hv_spread if not math.isnan(iv_hv_spread) else np.nan,
+            rv_reference=rv_reference,
+            rv_reference_source=rv_source,
+            rv_reference_status=rv_status,
+            rv_observation_count=rv_count,
+            rv_iv_edge=rv_iv_edge,
+            iv_rv_ratio=iv_rv_ratio,
             atm_iv_contract_count=atm.contract_count,
             atm_iv_contract_ids=atm.contract_ids,
             atm_iv_maturities=atm.maturities,
@@ -215,6 +247,7 @@ class VolatilityEngine:
                 atm_config,
                 trading_date=snapshot.trading_date,
                 underlying=snapshot.underlying,
+                hv_history=hv,
             )
             row = {
                 "trading_date": signal.trading_date,
@@ -228,8 +261,14 @@ class VolatilityEngine:
                 "hv_10": float(hv_state.get("hv_10", np.nan)),
                 "hv_20": float(hv_state.get("hv_20", np.nan)),
                 "hv_60": float(hv_state.get("hv_60", np.nan)),
+                "rv_reference": signal.rv_reference,
+                "rv_reference_source": signal.rv_reference_source,
+                "rv_reference_status": signal.rv_reference_status,
+                "rv_observation_count": signal.rv_observation_count,
                 "iv_hv_spread": signal.iv_hv_spread,
                 "hv_iv_edge": signal.hv_iv_edge,
+                "rv_iv_edge": signal.rv_iv_edge,
+                "iv_rv_ratio": signal.iv_rv_ratio,
                 "term_slope": np.nan,
                 "iv_valid_count": signal.iv_valid_count,
                 "iv_failed_count": signal.iv_failed_count,
@@ -240,6 +279,64 @@ class VolatilityEngine:
         if not frame.empty:
             frame = frame.sort_values("trading_date").reset_index(drop=True)
         return VolatilityTimeSeries(underlying=underlying, frame=frame)
+
+    def _rv_reference(
+        self,
+        hv_state: pd.Series,
+        *,
+        hv_history: pd.DataFrame | None,
+        trading_date: date,
+    ) -> tuple[float, str, str, int]:
+        column = self.config.rv_reference_hv_column
+        mode = self.config.rv_reference_mode
+        current = _to_float(hv_state.get(column, np.nan))
+        source_prefix = f"{mode}:{column}"
+        if not _is_positive(current):
+            return np.nan, source_prefix, "missing_hv", 0
+
+        history = self._rv_history(hv_history, column=column, trading_date=trading_date)
+        observation_count = int(history.notna().sum()) if history is not None else 1
+        if mode == "current_hv":
+            return current, f"current_hv:{column}", "ok", observation_count
+
+        if history is None:
+            return np.nan, source_prefix, "insufficient_history", 0
+        sample = history.dropna()
+        if self.config.vol_filter_calibration_mode == "walk_forward":
+            sample = sample.tail(self.config.rv_distribution_lookback_days)
+        observation_count = int(len(sample))
+        if observation_count < self.config.rv_distribution_min_observations:
+            return np.nan, source_prefix, "insufficient_history", observation_count
+
+        if mode == "rolling_quantile":
+            value = float(sample.quantile(self.config.rv_distribution_quantile))
+            source = f"rolling_quantile:{column}:{self.config.rv_distribution_quantile:g}"
+        elif mode == "rolling_median":
+            value = float(sample.median())
+            source = f"rolling_median:{column}"
+        elif mode == "max_current_and_quantile":
+            quantile = float(sample.quantile(self.config.rv_distribution_quantile))
+            value = max(current, quantile)
+            source = f"max_current_and_quantile:{column}:{self.config.rv_distribution_quantile:g}"
+        else:
+            raise ValueError(f"Unsupported rv_reference_mode: {mode}")
+
+        if not _is_positive(value):
+            return np.nan, source, "invalid_reference", observation_count
+        return value, source, "ok", observation_count
+
+    def _rv_history(self, hv_history: pd.DataFrame | None, *, column: str, trading_date: date) -> pd.Series | None:
+        if hv_history is None or column not in hv_history.columns:
+            return None
+        history = pd.to_numeric(hv_history[column], errors="coerce").sort_index()
+        if self.config.vol_filter_calibration_mode == "walk_forward":
+            trading_timestamp = pd.Timestamp(trading_date)
+            index = pd.to_datetime(history.index)
+            series = pd.Series(history.to_numpy(dtype=float), index=index)
+            return series.loc[series.index <= trading_timestamp]
+        if self.config.vol_filter_calibration_mode == "full_sample_calibration":
+            return history
+        raise ValueError(f"Unsupported vol_filter_calibration_mode: {self.config.vol_filter_calibration_mode}")
 
     def _select_iv_price(self, frame: pd.DataFrame) -> pd.Series:
         if self.config.iv_price_column not in frame.columns:
@@ -306,6 +403,10 @@ class VolatilityEngine:
                     strike=float(row.strike),
                     ttm_years=float(row.ttm_years),
                     risk_free_rate=self.config.risk_free_rate,
+                    lower=self.config.iv_bisection_lower,
+                    upper=self.config.iv_bisection_upper,
+                    tolerance=self.config.iv_bisection_tolerance,
+                    max_iterations=self.config.iv_bisection_max_iterations,
                 )
             )
         return pd.Series(values, index=frame.index)
@@ -341,10 +442,10 @@ def _implied_vol_bisection(
     strike: float,
     ttm_years: float,
     risk_free_rate: float,
-    lower: float = 0.0001,
-    upper: float = 5.0,
-    tolerance: float = 1e-8,
-    max_iterations: int = 100,
+    lower: float,
+    upper: float,
+    tolerance: float,
+    max_iterations: int,
 ) -> float:
     low = lower
     high = upper
@@ -383,3 +484,15 @@ def _black_scholes_price(
 
 def _normal_cdf(value: float) -> float:
     return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+def _to_float(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _is_positive(value: object) -> bool:
+    number = _to_float(value)
+    return not math.isnan(number) and not math.isinf(number) and number > 0

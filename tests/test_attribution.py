@@ -26,6 +26,7 @@ def _base_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFra
             "trade_amount": [100.0],
             "fee": [2.0],
             "reason": ["test"],
+            "episode_id": ["episode_1"],
         }
     )
     position_records = pd.DataFrame(
@@ -39,6 +40,7 @@ def _base_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFra
             "liquidation_price": [1.0, 100.0],
             "theoretical_unrealized_pnl": [0.0, 0.0],
             "role": ["call_leg", "delta_hedge"],
+            "episode_id": ["episode_1", "episode_1"],
         }
     )
     greeks_history = pd.DataFrame(
@@ -102,6 +104,22 @@ def test_cumulative_attribution_is_daily_component_cumsum_for_visualization() ->
     assert cumulative["cum_theta_pnl"] == pytest.approx(result.daily["theta_pnl"].sum())
     assert cumulative["cum_vega_pnl"] == pytest.approx(result.daily["vega_pnl"].sum())
     assert cumulative["cum_gamma_theta_pnl"] == pytest.approx(result.daily["gamma_theta_pnl"].sum())
+
+
+def test_by_episode_attribution_contains_defined_components_without_actual_or_residual() -> None:
+    result = GreeksPnLAttribution().attribute_daily(*_base_inputs())
+
+    row = result.by_episode[result.by_episode["episode_id"].eq("episode_1")].iloc[0]
+
+    assert "actual_pnl" not in result.by_episode.columns
+    assert "residual_pnl" not in result.by_episode.columns
+    assert row["delta_pnl"] == pytest.approx(200.0)
+    assert row["gamma_pnl"] == pytest.approx(4.0)
+    assert row["theta_pnl"] == pytest.approx(-40.0)
+    assert row["vega_pnl"] == pytest.approx(6.0)
+    assert row["hedge_pnl"] == pytest.approx(-100.0)
+    assert row["cost_pnl"] == pytest.approx(-2.0)
+    assert row["explained_pnl"] == pytest.approx(68.0)
 
 
 def test_missing_iv_is_zeroed_and_reported_in_quality_table() -> None:
@@ -267,6 +285,7 @@ def test_attribution_result_exports_csv(tmp_path) -> None:
     paths = result.export_csv(tmp_path)
 
     assert paths["greeks_attribution"].exists()
+    assert paths["greeks_attribution_by_episode"].exists()
     assert paths["greeks_attribution_cumulative"].exists()
     assert paths["attribution_quality"].exists()
 

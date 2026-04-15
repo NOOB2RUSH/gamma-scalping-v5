@@ -43,7 +43,7 @@ class GreeksCalculator:
 
 - `T` 统一使用交易日口径：`T = remaining_trading_days / annual_trading_days`。
 - `remaining_trading_days` 由中国大陆交易日历计算，自动跳过周末和中国大陆法定节假日。
-- `annual_trading_days` 默认 `252`，可配置，但全系统必须使用同一个值。
+- `annual_trading_days` 默认 `252`，可配置；统一回测入口应通过 `common.annual_trading_days` 同步传播到全系统，避免各模块口径不一致。
 - 当到期日不是交易日时，先按交易日历调整到前一个有效交易日，再计算 `T`。
 - 无风险利率 `r` 是模型配置项，默认 `0`；分红率 `q` 也作为配置项，默认 `0`。
 - `vega` 输出为波动率变动 1.00 的价格敏感度；`py_vollib_vectorized` 原始 vega 为 1 vol point 口径，封装层需要乘以 `100`。

@@ -23,6 +23,40 @@ hv_window = std(log_return, window) * sqrt(annualization_days)
 - `hv_20`
 - `hv_60`
 
+## RV 参考值
+
+策略模块需要一个“预期实现波动率代理”来判断期权 IV 是否便宜。波动率模块应在不引入未来函数的前提下输出 `rv_reference`，供策略入场和平仓使用。
+
+这些字段和计算模式归属 `VolatilityConfig`，由 `VolatilityEngine.build_signal` / `build_signal_series` 计算。策略层只消费最终信号，不自行访问 HV 历史序列。
+
+第一版默认：
+
+```text
+rv_reference = hv_20
+rv_reference_source = "current_hv:hv_20"
+rv_reference_status = "ok" | "missing_hv" | "insufficient_history" | "invalid_reference"
+rv_observation_count = hv_20 有效窗口样本数
+```
+
+后续可支持滚动历史分布：
+
+```text
+vol_filter_calibration_mode = "walk_forward" | "full_sample_calibration"
+rv_reference_mode = "current_hv" | "rolling_quantile" | "rolling_median" | "max_current_and_quantile"
+rv_reference_hv_column = "hv_20"
+rv_distribution_lookback_days = 252
+rv_distribution_min_observations = 60
+rv_distribution_quantile = 0.50
+```
+
+约束：
+
+- 默认必须使用 walk-forward 口径，只能使用当日及以前数据。
+- 不得使用完整回测区间的 HV 分布作为历史任意一天的交易判断依据。
+- 当历史样本不足时，`rv_reference_status` 应输出为 `insufficient_history`，策略不得因此开新仓。
+- 当 HV 缺失或 `rv_reference <= 0` 时，`rv_reference_status` 应分别输出为 `missing_hv` 或 `invalid_reference`。
+- `full_sample_calibration` 只能作为研究模式，用于参数探索或报告诊断，不得作为正式回测绩效口径。
+
 ## 隐含波动率
 
 使用期权市场价格反解 Black-Scholes 隐含波动率。第一版默认通过 `py_vollib_vectorized` 批量求解，但只支持 `dividend_rate = 0`：
@@ -31,7 +65,7 @@ hv_window = std(log_return, window) * sqrt(annualization_days)
 - 若 bid/ask 无效，则按配置回退到 `close` 或剔除。
 - 业务层负责过滤低于内在价值或高于理论上界的无效价格。
 - 求解失败时保留合约但设置 `iv_status='failed'`。
-- 若 `py_vollib_vectorized` 不可用，再使用本地 Brent 二分 fallback，边界如 `[0.0001, 5.0]`。
+- 若 `py_vollib_vectorized` 不可用，再使用本地二分 fallback；下界、上界、收敛容差和最大迭代次数分别由 `VolatilityConfig.iv_bisection_lower`、`iv_bisection_upper`、`iv_bisection_tolerance`、`iv_bisection_max_iterations` 配置，默认值为 `0.0001`、`5.0`、`1e-8`、`100`。
 - 若配置 `dividend_rate != 0`，第一版显式报错，不做隐式 fallback。原因是 IV 求解会直接影响策略信号，非零分红率口径需要单独验证后再开放。
 
 ## 曲面快照
@@ -100,8 +134,14 @@ VolatilityTimeSeries(
         hv_10,
         hv_20,
         hv_60,
+        rv_reference,
+        rv_reference_source,
+        rv_reference_status,
+        rv_observation_count,
         iv_hv_spread,
         hv_iv_edge,
+        iv_rv_ratio,
+        rv_iv_edge,
         term_slope,
         iv_valid_count,
         iv_failed_count,
@@ -116,6 +156,10 @@ VolatilityTimeSeries(
 - `atm_iv_min_ttm_days`、`atm_iv_max_ttm_days` 记录本次聚合配置，避免不同配置的曲线混用。
 - `iv_hv_spread = atm_iv - hv_20`。
 - `hv_iv_edge = hv_20 - atm_iv`，买 gamma 策略可以直接读取该方向的波动率边际。
+- `rv_reference` 是策略过滤使用的 RV/HV 参考值，第一版可等于 `hv_20`，后续可来自滚动分布。
+- `rv_reference_status` 表示 RV 参考值是否可用于交易判断；只有 `ok` 才允许策略通过 IV/HV 过滤开仓。
+- `iv_rv_ratio = atm_iv / rv_reference`。
+- `rv_iv_edge = rv_reference - atm_iv`。
 - `iv_status_summary` 记录逐合约 IV 求解状态计数，供图表展示数据质量。
 
 ## 策略信号
@@ -126,7 +170,13 @@ VolatilityTimeSeries(
 - `atm_iv_contract_count`
 - `atm_iv_contract_ids`
 - `hv_20`
+- `rv_reference`
+- `rv_reference_source`
+- `rv_reference_status`
+- `rv_observation_count`
 - `iv_hv_spread = atm_iv - hv_20`
+- `rv_iv_edge = rv_reference - atm_iv`
+- `iv_rv_ratio = atm_iv / rv_reference`
 - `rv_iv_spread = realized_vol_holding - entry_atm_iv`，用于事后评估。
 - `term_slope = next_month_atm_iv - front_month_atm_iv`
 - `iv_rank` 或 `iv_percentile`
@@ -169,6 +219,8 @@ class VolatilityEngine:
 - `dividend_rate != 0` 时显式报错。
 - ATM IV 聚合配置，如 `5-20` 个剩余交易日的 ATM 合约平均 IV。
 - `build_signal_series` 输出可直接绘制的 `atm_iv`、`hv_10`、`hv_20`、`hv_60` 时间序列。
+- `rv_reference` 由波动率模块按 `VolatilityConfig` 生成，rolling 模式不得读取未来 HV。
+- 历史样本不足、HV 缺失或参考值非法时，`rv_reference_status` 应明确标记，且 `rv_iv_edge`、`iv_rv_ratio` 不应被误用为有效交易信号。
 - 时间序列每个 `atm_iv` 点必须能追溯到合约 ID 和到期日。
 - 同一到期日 call/put IV 合并。
 - 缺失历史窗口时的行为。

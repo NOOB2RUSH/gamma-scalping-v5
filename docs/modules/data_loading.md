@@ -7,10 +7,13 @@
 ## 输入
 
 - `data_root`: 默认 `data/`
+- `etf_subdir`: ETF 数据子目录，默认 `etf`
+- `opt_subdir`: 期权数据子目录，默认 `opt`
 - `underlying`: 默认 `510050.XSHG`
 - `start_date` / `end_date`
 - `frequency`: 第一版固定为 `1d`
 - `price_policy`: `mid_first`、`close_only`、`bid_ask_conservative`
+- `parquet_cache_size`: parquet 文件读取缓存上限，默认 `512`；设为 `0` 表示禁用缓存。
 - `calendar`: 中国大陆交易日历配置，默认自动跳过周末和中国大陆法定节假日。
 
 ## 输出

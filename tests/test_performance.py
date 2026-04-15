@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 
 from gamma_scalping.attribution import AttributionResult
-from gamma_scalping.performance import PerformanceAnalyzer, Visualizer
+from gamma_scalping.performance import IvHvCaptureAnalyzer, PerformanceAnalyzer, PerformanceConfig, Visualizer
 from gamma_scalping.volatility import VolatilityTimeSeries
 
 
@@ -28,6 +28,16 @@ def _result() -> SimpleNamespace:
                 "instrument_type": ["option", "", "etf"],
                 "trade_amount": [1000.0, 0.0, 500.0],
                 "fee": [2.0, 0.0, 1.0],
+            }
+        ),
+        episode_records=pd.DataFrame(
+            {
+                "episode_id": ["episode_1"],
+                "opened_at": [date(2024, 4, 8)],
+                "closed_at": [date(2024, 4, 11)],
+                "entry_atm_iv": [0.20],
+                "entry_hv_20": [0.18],
+                "entry_spot": [100.0],
             }
         ),
     )
@@ -68,7 +78,31 @@ def _attribution() -> AttributionResult:
         }
     )
     quality = pd.DataFrame({"trading_date": daily["trading_date"], "residual_ratio": [0.0, 0.02, 0.03]})
-    return AttributionResult(daily=daily, cumulative=cumulative, quality=quality)
+    by_episode = pd.DataFrame(
+        {
+            "trading_date": [date(2024, 4, 9), date(2024, 4, 10), date(2024, 4, 11)],
+            "episode_id": ["episode_1", "episode_1", "episode_1"],
+            "delta_pnl": [0.0, 0.0, 0.0],
+            "gamma_pnl": [2.0, 3.0, 4.0],
+            "theta_pnl": [-1.0, -1.0, -1.0],
+            "vega_pnl": [0.5, -0.2, 0.1],
+            "hedge_pnl": [-0.1, 0.2, -0.1],
+            "cost_pnl": [-0.05, -0.05, -0.05],
+            "explained_pnl": [1.35, 2.15, 2.85],
+            "gamma_theta_pnl": [1.0, 2.0, 3.0],
+            "option_gamma_exposure": [100.0, 100.0, 100.0],
+        }
+    )
+    return AttributionResult(daily=daily, cumulative=cumulative, quality=quality, by_episode=by_episode)
+
+
+def _underlying_history() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "trading_date": [date(2024, 4, 8), date(2024, 4, 9), date(2024, 4, 10), date(2024, 4, 11)],
+            "close": [100.0, 101.0, 99.0, 102.0],
+        }
+    )
 
 
 def _volatility() -> VolatilityTimeSeries:
@@ -116,13 +150,75 @@ def test_sortino_uses_downside_deviation_without_mean_adjustment() -> None:
 
 
 def test_performance_analyzer_consumes_attribution_and_volatility_outputs() -> None:
-    metrics = PerformanceAnalyzer().compute_metrics(_result(), attribution=_attribution(), volatility=_volatility())
+    metrics = PerformanceAnalyzer().compute_metrics(
+        _result(),
+        attribution=_attribution(),
+        volatility=_volatility(),
+        underlying_history=_underlying_history(),
+    )
 
     assert metrics.summary["avg_delta_exposure"] == pytest.approx(10.0)
     assert metrics.summary["total_gamma_theta_pnl"] == pytest.approx(7.0)
     assert metrics.summary["total_vega_pnl"] == pytest.approx(1.0)
     assert metrics.summary["avg_atm_iv"] == pytest.approx(0.20)
     assert metrics.summary["total_iv_failed_count"] == pytest.approx(1.0)
+    assert metrics.summary["iv_hv_capture_rate_valid_count"] == pytest.approx(1.0)
+
+
+def test_performance_analyzer_passes_iv_hv_capture_config() -> None:
+    metrics = PerformanceAnalyzer(
+        PerformanceConfig(iv_hv_capture_min_return_observations=4)
+    ).compute_metrics(
+        _result(),
+        attribution=_attribution(),
+        volatility=_volatility(),
+        underlying_history=_underlying_history(),
+    )
+
+    assert metrics.summary["iv_hv_capture_rate_valid_count"] == pytest.approx(0.0)
+
+
+def test_iv_hv_capture_uses_episode_attribution_and_entry_atm_iv() -> None:
+    capture = IvHvCaptureAnalyzer().compute(
+        episode_records=_result().episode_records,
+        attribution=_attribution(),
+        underlying_history=_underlying_history(),
+    )
+
+    row = capture.episodes.iloc[0]
+    returns = [
+        math.log(101.0 / 100.0),
+        math.log(99.0 / 101.0),
+        math.log(102.0 / 99.0),
+    ]
+    expected_theoretical = sum(
+        0.5 * 100.0 * spot * spot * (ret * ret - 0.20**2 / 252)
+        for spot, ret in zip([100.0, 101.0, 99.0], returns)
+    )
+
+    assert row["valid"]
+    assert row["net_gamma_scalping_pnl"] == pytest.approx(6.0 - 0.0 - 0.15)
+    assert row["theoretical_vol_edge_pnl"] == pytest.approx(expected_theoretical)
+    assert row["iv_hv_capture_rate"] == pytest.approx(row["net_gamma_scalping_pnl"] / expected_theoretical)
+    assert row["realized_vol_holding"] == pytest.approx(pd.Series(returns).std(ddof=0) * math.sqrt(252))
+    assert capture.summary["iv_hv_capture_rate_weighted"] == pytest.approx(row["iv_hv_capture_rate"])
+
+
+def test_iv_hv_capture_marks_missing_attribution_invalid() -> None:
+    attribution = AttributionResult(
+        daily=_attribution().daily,
+        cumulative=_attribution().cumulative,
+        quality=_attribution().quality,
+    )
+
+    capture = IvHvCaptureAnalyzer().compute(
+        episode_records=_result().episode_records,
+        attribution=attribution,
+        underlying_history=_underlying_history(),
+    )
+
+    assert not capture.episodes.iloc[0]["valid"]
+    assert "missing_episode_attribution" in capture.episodes.iloc[0]["invalid_reason"]
 
 
 def test_visualizer_saves_equity_and_attribution_figures(tmp_path) -> None:
@@ -141,11 +237,13 @@ def test_visualizer_saves_equity_and_attribution_figures(tmp_path) -> None:
 
 
 def test_performance_report_exports_tables_html_and_figures(tmp_path) -> None:
-    report = PerformanceAnalyzer().build_report(
+    analyzer = PerformanceAnalyzer()
+    report = analyzer.build_report(
         _result(),
         tmp_path,
         attribution=_attribution(),
         volatility=_volatility(),
+        underlying_history=_underlying_history(),
     )
 
     assert report.paths["metrics"].exists()
@@ -157,6 +255,31 @@ def test_performance_report_exports_tables_html_and_figures(tmp_path) -> None:
     assert report.paths["volatility"].exists()
     assert report.paths["greeks_attribution_daily"].exists()
     assert report.paths["greeks_attribution_cumulative"].exists()
+    assert report.paths["iv_hv_capture_episodes"].exists()
+    assert report.metrics.iv_hv_capture is not None
+
+
+def test_performance_report_reuses_iv_hv_capture_result(tmp_path, monkeypatch) -> None:
+    analyzer = PerformanceAnalyzer()
+    calls = 0
+    original = analyzer._compute_iv_hv_capture
+
+    def wrapped_compute_capture(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(analyzer, "_compute_iv_hv_capture", wrapped_compute_capture)
+
+    analyzer.build_report(
+        _result(),
+        tmp_path,
+        attribution=_attribution(),
+        volatility=_volatility(),
+        underlying_history=_underlying_history(),
+    )
+
+    assert calls == 1
 
 
 def test_performance_analyzer_handles_empty_equity_curve() -> None:

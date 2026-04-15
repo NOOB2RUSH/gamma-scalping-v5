@@ -18,6 +18,7 @@ class StrategyPosition:
     strategy_tag: str = "gamma_scalping"
     role: str = ""
     entry_trading_date: date | None = None
+    episode_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,7 @@ class OrderIntent:
     quantity: float
     reason: str
     role: str = ""
+    episode_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -65,4 +67,11 @@ class StrategyDecision:
     selected_contracts: tuple[str, ...] = field(default_factory=tuple)
     reason: str = ""
     risk_flags: tuple[str, ...] = field(default_factory=tuple)
-
+    episode_id: str = ""
+    entry_atm_iv: float | None = None
+    entry_hv_20: float | None = None
+    entry_spot: float | None = None
+    entry_edge: float | None = None
+    entry_ratio: float | None = None
+    rv_reference: float | None = None
+    rv_reference_source: str = ""

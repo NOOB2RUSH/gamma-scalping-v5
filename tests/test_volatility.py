@@ -9,6 +9,7 @@ import pytest
 from gamma_scalping.data.models import ETFBar, MarketSnapshot, OptionChain
 from gamma_scalping.greeks import GreeksCalculator, GreeksConfig
 from gamma_scalping.volatility import AtmIvConfig, VolatilityConfig, VolatilityEngine
+import gamma_scalping.volatility.engine as volatility_engine_module
 
 
 def _priced_option_chain() -> OptionChain:
@@ -100,6 +101,37 @@ def test_solve_iv_chain_uses_bisection_fallback(monkeypatch) -> None:
     assert surface.loc[surface["contract_id"].eq("C1"), "iv"].iloc[0] == pytest.approx(0.2, rel=1e-4)
 
 
+def test_bisection_fallback_uses_configured_solver_parameters(monkeypatch) -> None:
+    engine = VolatilityEngine(
+        VolatilityConfig(
+            iv_bisection_lower=0.05,
+            iv_bisection_upper=1.5,
+            iv_bisection_tolerance=1e-6,
+            iv_bisection_max_iterations=7,
+        )
+    )
+    seen: list[dict[str, object]] = []
+
+    def fail_vectorized(*args, **kwargs):
+        raise RuntimeError("forced failure")
+
+    def fake_bisection(**kwargs):
+        seen.append(kwargs)
+        return 0.2
+
+    monkeypatch.setattr(engine, "_solve_iv_vectorized", fail_vectorized)
+    monkeypatch.setattr(volatility_engine_module, "_implied_vol_bisection", fake_bisection)
+
+    surface = engine.solve_iv_chain(_snapshot())
+
+    assert surface["iv_status"].value_counts().to_dict() == {"ok": 5}
+    assert seen
+    assert seen[0]["lower"] == pytest.approx(0.05)
+    assert seen[0]["upper"] == pytest.approx(1.5)
+    assert seen[0]["tolerance"] == pytest.approx(1e-6)
+    assert seen[0]["max_iterations"] == 7
+
+
 def test_dividend_rate_nonzero_explicitly_fails() -> None:
     with pytest.raises(ValueError, match="dividend_rate=0"):
         VolatilityEngine(VolatilityConfig(dividend_rate=0.01))
@@ -157,10 +189,90 @@ def test_build_signal_series_outputs_visualization_columns() -> None:
         "hv_10",
         "hv_20",
         "hv_60",
+        "rv_reference",
+        "rv_reference_source",
+        "rv_reference_status",
+        "rv_observation_count",
         "iv_hv_spread",
         "hv_iv_edge",
+        "rv_iv_edge",
+        "iv_rv_ratio",
         "iv_status_summary",
     ]:
         assert column in frame.columns
     assert frame.loc[0, "atm_iv"] == pytest.approx(0.2, rel=1e-4)
     assert frame.loc[0, "atm_iv_contract_count"] == 2
+    assert frame.loc[0, "rv_reference_status"] == "ok"
+
+
+def test_build_signal_outputs_current_rv_reference() -> None:
+    snapshot = _snapshot()
+    engine = VolatilityEngine()
+    surface = engine.solve_iv_chain(snapshot)
+    hv_state = pd.Series({"hv_20": 0.24})
+
+    signal = engine.build_signal(
+        surface,
+        hv_state,
+        AtmIvConfig(min_ttm_days=5, max_ttm_days=20),
+        trading_date=snapshot.trading_date,
+        underlying=snapshot.underlying,
+    )
+
+    assert signal.rv_reference == pytest.approx(0.24)
+    assert signal.rv_reference_source == "current_hv:hv_20"
+    assert signal.rv_reference_status == "ok"
+    assert signal.rv_iv_edge == pytest.approx(0.04, rel=1e-4)
+    assert signal.iv_rv_ratio == pytest.approx(0.2 / 0.24, rel=1e-4)
+
+
+def test_build_signal_rolling_reference_uses_only_past_history() -> None:
+    snapshot = _snapshot()
+    engine = VolatilityEngine(
+        VolatilityConfig(
+            rv_reference_mode="rolling_quantile",
+            rv_distribution_min_observations=2,
+            rv_distribution_lookback_days=2,
+            rv_distribution_quantile=0.5,
+        )
+    )
+    surface = engine.solve_iv_chain(snapshot)
+    history = pd.DataFrame(
+        {"hv_20": [0.10, 0.20, 0.30, 0.90]},
+        index=pd.to_datetime(["2024-04-05", "2024-04-08", "2024-04-09", "2024-04-10"]),
+    )
+
+    signal = engine.build_signal(
+        surface,
+        pd.Series({"hv_20": 0.20}),
+        AtmIvConfig(min_ttm_days=5, max_ttm_days=20),
+        trading_date=snapshot.trading_date,
+        underlying=snapshot.underlying,
+        hv_history=history,
+    )
+
+    assert signal.rv_reference == pytest.approx(0.15)
+    assert signal.rv_reference_status == "ok"
+    assert signal.rv_observation_count == 2
+
+
+def test_build_signal_marks_insufficient_rv_reference_history() -> None:
+    snapshot = _snapshot()
+    engine = VolatilityEngine(
+        VolatilityConfig(rv_reference_mode="rolling_median", rv_distribution_min_observations=3)
+    )
+    surface = engine.solve_iv_chain(snapshot)
+    history = pd.DataFrame({"hv_20": [0.10, 0.20]}, index=pd.to_datetime(["2024-04-05", "2024-04-08"]))
+
+    signal = engine.build_signal(
+        surface,
+        pd.Series({"hv_20": 0.20}),
+        AtmIvConfig(min_ttm_days=5, max_ttm_days=20),
+        trading_date=snapshot.trading_date,
+        underlying=snapshot.underlying,
+        hv_history=history,
+    )
+
+    assert signal.rv_reference_status == "insufficient_history"
+    assert pd.isna(signal.rv_reference)
+    assert pd.isna(signal.rv_iv_edge)

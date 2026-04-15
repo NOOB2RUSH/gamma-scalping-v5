@@ -7,12 +7,17 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from gamma_scalping.export_format import format_for_csv
+from gamma_scalping.performance.iv_hv_capture import IvHvCaptureAnalyzer, IvHvCaptureConfig, IvHvCaptureResult
+
 
 @dataclass(frozen=True)
 class PerformanceConfig:
     annual_trading_days: int = 252
     risk_free_rate: float = 0.0
     var_level: float = 0.05
+    iv_hv_capture_denominator_eps: float = 1e-8
+    iv_hv_capture_min_return_observations: int = 2
 
 
 @dataclass(frozen=True)
@@ -20,6 +25,7 @@ class PerformanceMetrics:
     summary: dict[str, float]
     daily_returns: pd.DataFrame
     monthly_returns: pd.DataFrame
+    iv_hv_capture: IvHvCaptureResult | None = None
 
 
 @dataclass(frozen=True)
@@ -38,11 +44,16 @@ class PerformanceAnalyzer:
         *,
         attribution: Any | None = None,
         volatility: Any | None = None,
+        underlying_history: pd.DataFrame | None = None,
     ) -> PerformanceMetrics:
         equity_curve = _frame_from(result, "equity_curve")
         equity_curve = _normalize_trading_date(equity_curve)
         if equity_curve.empty:
-            return PerformanceMetrics(summary=_empty_summary(), daily_returns=_empty_returns(), monthly_returns=_empty_returns())
+            return PerformanceMetrics(
+                summary=_empty_summary(),
+                daily_returns=_empty_returns(),
+                monthly_returns=_empty_returns(),
+            )
         if "equity" not in equity_curve.columns:
             raise ValueError("equity_curve must contain an 'equity' column")
 
@@ -62,10 +73,19 @@ class PerformanceAnalyzer:
         if volatility_frame is not None and not volatility_frame.empty:
             summary.update(_volatility_summary(volatility_frame))
 
+        capture = self._compute_iv_hv_capture(
+            result,
+            attribution=attribution,
+            underlying_history=underlying_history,
+        )
+        if capture is not None:
+            summary.update(capture.summary)
+
         return PerformanceMetrics(
             summary=_sanitize_summary(summary),
             daily_returns=daily_returns,
             monthly_returns=monthly_returns,
+            iv_hv_capture=capture,
         )
 
     def build_report(
@@ -75,27 +95,37 @@ class PerformanceAnalyzer:
         *,
         attribution: Any | None = None,
         volatility: Any | None = None,
+        underlying_history: pd.DataFrame | None = None,
+        matplotlib_config_dir: Path | str | None = None,
     ) -> PerformanceReport:
         from gamma_scalping.performance.visualizer import Visualizer
 
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        metrics = self.compute_metrics(result, attribution=attribution, volatility=volatility)
+        metrics = self.compute_metrics(
+            result,
+            attribution=attribution,
+            volatility=volatility,
+            underlying_history=underlying_history,
+        )
         paths = {
             "metrics": output_dir / "performance_metrics.csv",
             "daily_returns": output_dir / "daily_returns.csv",
             "monthly_returns": output_dir / "monthly_returns.csv",
             "report": output_dir / "performance_report.html",
         }
-        pd.DataFrame([metrics.summary]).to_csv(paths["metrics"], index=False)
-        metrics.daily_returns.to_csv(paths["daily_returns"], index=False)
-        metrics.monthly_returns.to_csv(paths["monthly_returns"], index=False)
+        format_for_csv(pd.DataFrame([metrics.summary])).to_csv(paths["metrics"], index=False)
+        format_for_csv(metrics.daily_returns).to_csv(paths["daily_returns"], index=False)
+        format_for_csv(metrics.monthly_returns).to_csv(paths["monthly_returns"], index=False)
 
-        visualizer = Visualizer()
+        visualizer = Visualizer(matplotlib_config_dir=matplotlib_config_dir)
         figure_paths: dict[str, Path] = {}
         equity_curve = _frame_from(result, "equity_curve")
         if not equity_curve.empty:
-            figure_paths["equity_curve"] = visualizer.save(visualizer.plot_equity_curve(equity_curve), output_dir / "equity_curve.png")
+            figure_paths["equity_curve"] = visualizer.save(
+                visualizer.plot_equity_curve(equity_curve, underlying_history=underlying_history),
+                output_dir / "equity_curve.png",
+            )
             figure_paths["drawdown"] = visualizer.save(visualizer.plot_drawdown(equity_curve), output_dir / "drawdown.png")
         if volatility is not None:
             volatility_frame = _optional_attr_frame(volatility, "frame")
@@ -117,9 +147,36 @@ class PerformanceAnalyzer:
                     visualizer.plot_greeks_attribution_cumulative(attribution),
                     output_dir / "greeks_attribution_cumulative.png",
                 )
+        if metrics.iv_hv_capture is not None:
+            paths.update(metrics.iv_hv_capture.export_csv(output_dir))
         paths.update(figure_paths)
         paths["report"].write_text(_html_report(metrics, figure_paths), encoding="utf-8")
         return PerformanceReport(metrics=metrics, paths=paths)
+
+    def _compute_iv_hv_capture(
+        self,
+        result: Any,
+        *,
+        attribution: Any | None,
+        underlying_history: pd.DataFrame | None,
+    ) -> IvHvCaptureResult | None:
+        if attribution is None or underlying_history is None:
+            return None
+        episode_records = _frame_from(result, "episode_records", optional=True)
+        if episode_records.empty:
+            return None
+        return IvHvCaptureAnalyzer(self._iv_hv_capture_config()).compute(
+            episode_records=episode_records,
+            attribution=attribution,
+            underlying_history=underlying_history,
+        )
+
+    def _iv_hv_capture_config(self) -> IvHvCaptureConfig:
+        return IvHvCaptureConfig(
+            annual_trading_days=self.config.annual_trading_days,
+            denominator_eps=self.config.iv_hv_capture_denominator_eps,
+            min_return_observations=self.config.iv_hv_capture_min_return_observations,
+        )
 
     def _core_summary(self, equity: pd.Series, returns: pd.Series) -> dict[str, float]:
         initial_equity = float(equity.iloc[0])

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
+
+from gamma_scalping.export_format import format_for_csv
 
 
 DAILY_COLUMNS = [
@@ -44,6 +46,27 @@ CUMULATIVE_COLUMNS = [
     "cum_gamma_theta_pnl",
 ]
 
+EPISODE_COLUMNS = [
+    "trading_date",
+    "episode_id",
+    "underlying",
+    "delta_pnl",
+    "gamma_pnl",
+    "theta_pnl",
+    "vega_pnl",
+    "hedge_pnl",
+    "cost_pnl",
+    "explained_pnl",
+    "gamma_theta_pnl",
+    "option_delta_exposure",
+    "option_gamma_exposure",
+    "option_theta_exposure",
+    "option_vega_exposure",
+    "weighted_position_iv",
+    "weighted_position_iv_change",
+    "quality_flags",
+]
+
 QUALITY_COLUMNS = [
     "trading_date",
     "residual_ratio",
@@ -68,18 +91,21 @@ class AttributionResult:
     daily: pd.DataFrame
     cumulative: pd.DataFrame
     quality: pd.DataFrame
+    by_episode: pd.DataFrame = field(default_factory=lambda: pd.DataFrame(columns=EPISODE_COLUMNS))
 
     def export_csv(self, output_dir: Path | str) -> dict[str, Path]:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         paths = {
             "greeks_attribution": output_dir / "greeks_attribution.csv",
+            "greeks_attribution_by_episode": output_dir / "greeks_attribution_by_episode.csv",
             "greeks_attribution_cumulative": output_dir / "greeks_attribution_cumulative.csv",
             "attribution_quality": output_dir / "attribution_quality.csv",
         }
-        self.daily.to_csv(paths["greeks_attribution"], index=False)
-        self.cumulative.to_csv(paths["greeks_attribution_cumulative"], index=False)
-        self.quality.to_csv(paths["attribution_quality"], index=False)
+        format_for_csv(self.daily).to_csv(paths["greeks_attribution"], index=False)
+        format_for_csv(self.by_episode).to_csv(paths["greeks_attribution_by_episode"], index=False)
+        format_for_csv(self.cumulative).to_csv(paths["greeks_attribution_cumulative"], index=False)
+        format_for_csv(self.quality).to_csv(paths["attribution_quality"], index=False)
         return paths
 
 
@@ -104,6 +130,7 @@ class GreeksPnLAttribution:
                 daily=pd.DataFrame(columns=DAILY_COLUMNS),
                 cumulative=pd.DataFrame(columns=CUMULATIVE_COLUMNS),
                 quality=pd.DataFrame(columns=QUALITY_COLUMNS),
+                by_episode=pd.DataFrame(columns=EPISODE_COLUMNS),
             )
 
         trade_records = _prepare_optional_table(trade_records, "trade_records")
@@ -134,6 +161,7 @@ class GreeksPnLAttribution:
         iv_by_key = iv_history.set_index(["trading_date", "contract_id"])
 
         daily_rows = []
+        episode_rows = []
         quality_rows = []
         for idx, trading_date in enumerate(dates):
             if idx == 0:
@@ -150,13 +178,25 @@ class GreeksPnLAttribution:
                     greeks_by_key=greeks_by_key,
                     iv_by_key=iv_by_key,
                 )
+                episode_rows.extend(
+                    self._attribute_episode_rows(
+                        trading_date=trading_date,
+                        prev_date=prev_date,
+                        underlying_by_date=underlying_by_date,
+                        positions_by_date=positions_by_date,
+                        trades_by_date=trades_by_date,
+                        greeks_by_key=greeks_by_key,
+                        iv_by_key=iv_by_key,
+                    )
+                )
             daily_rows.append(row)
             quality_rows.append(quality)
 
         daily = pd.DataFrame(daily_rows, columns=DAILY_COLUMNS)
         cumulative = self._build_cumulative(daily)
         quality = pd.DataFrame(quality_rows, columns=QUALITY_COLUMNS)
-        return AttributionResult(daily=daily, cumulative=cumulative, quality=quality)
+        by_episode = pd.DataFrame(episode_rows, columns=EPISODE_COLUMNS)
+        return AttributionResult(daily=daily, cumulative=cumulative, quality=quality, by_episode=by_episode)
 
     def _first_row(self, trading_date: object, underlying_by_date: pd.DataFrame) -> tuple[dict[str, object], dict[str, object]]:
         underlying = _underlying_for_date(underlying_by_date, trading_date)
@@ -164,6 +204,71 @@ class GreeksPnLAttribution:
         row["quality_flags"] = "first_row"
         quality = _quality_row(trading_date, 0.0, False, 0, 0, 0, 0, "first_row")
         return row, quality
+
+    def _attribute_episode_rows(
+        self,
+        *,
+        trading_date: object,
+        prev_date: object,
+        underlying_by_date: pd.DataFrame,
+        positions_by_date: dict[object, pd.DataFrame],
+        trades_by_date: dict[object, pd.DataFrame],
+        greeks_by_key: pd.DataFrame,
+        iv_by_key: pd.DataFrame,
+    ) -> list[dict[str, object]]:
+        spot_t, underlying_t = _spot_for_date(underlying_by_date, trading_date)
+        spot_prev, _ = _spot_for_date(underlying_by_date, prev_date)
+        missing_underlying = pd.isna(spot_t) or pd.isna(spot_prev)
+        d_spot = 0.0 if missing_underlying else float(spot_t) - float(spot_prev)
+        prev_positions = positions_by_date.get(prev_date, pd.DataFrame())
+        trades = trades_by_date.get(trading_date, pd.DataFrame())
+        episode_ids = sorted(_episode_ids(prev_positions, trades))
+        rows = []
+        for episode_id in episode_ids:
+            flags: list[str] = []
+            if missing_underlying:
+                flags.append("missing_underlying")
+            episode_positions = _filter_episode(prev_positions, episode_id)
+            option_positions = _option_positions(episode_positions)
+            etf_positions = _etf_positions(episode_positions)
+            exposures, missing_greeks_count = _option_exposures(option_positions, prev_date, greeks_by_key)
+            if missing_greeks_count:
+                flags.append("missing_greeks")
+            iv_state = _vega_and_iv_change(option_positions, prev_date, trading_date, greeks_by_key, iv_by_key)
+            if iv_state["missing_iv_count"]:
+                flags.append("missing_iv")
+            if iv_state["failed_iv_count"]:
+                flags.append("failed_iv")
+            delta_pnl = exposures["delta"] * d_spot
+            gamma_pnl = 0.5 * exposures["gamma"] * d_spot * d_spot
+            theta_pnl = exposures["theta"]
+            vega_pnl = iv_state["vega_pnl"]
+            hedge_pnl = _hedge_pnl(etf_positions, d_spot)
+            cost_pnl = -_trade_fees(_filter_episode(trades, episode_id))
+            explained_pnl = delta_pnl + gamma_pnl + theta_pnl + vega_pnl + hedge_pnl + cost_pnl
+            rows.append(
+                {
+                    "trading_date": trading_date,
+                    "episode_id": episode_id,
+                    "underlying": underlying_t,
+                    "delta_pnl": delta_pnl,
+                    "gamma_pnl": gamma_pnl,
+                    "theta_pnl": theta_pnl,
+                    "vega_pnl": vega_pnl,
+                    "hedge_pnl": hedge_pnl,
+                    "cost_pnl": cost_pnl,
+                    "explained_pnl": explained_pnl,
+                    "gamma_theta_pnl": gamma_pnl + theta_pnl,
+                    "option_delta_exposure": exposures["delta"],
+                    "option_gamma_exposure": exposures["gamma"],
+                    "option_theta_exposure": exposures["theta"],
+                    "option_vega_exposure": exposures["vega"],
+                    "weighted_position_iv": iv_state["weighted_position_iv"],
+                    "weighted_position_iv_change": iv_state["weighted_position_iv_change"],
+                    "quality_flags": ",".join(flags),
+                }
+            )
+        return rows
 
     def _attribute_row(
         self,
@@ -295,6 +400,9 @@ def _normalize_trading_date(frame: pd.DataFrame) -> pd.DataFrame:
 def _active_positions(position_records: pd.DataFrame) -> dict[object, pd.DataFrame]:
     records = position_records.copy()
     records["instrument_id"] = records["instrument_id"].fillna("").astype(str)
+    if "episode_id" not in records.columns:
+        records["episode_id"] = ""
+    records["episode_id"] = records["episode_id"].fillna("").astype(str)
     records["quantity"] = pd.to_numeric(records["quantity"], errors="coerce").fillna(0.0)
     records["multiplier"] = pd.to_numeric(records["multiplier"], errors="coerce").fillna(1.0)
     records = records[(records["instrument_id"] != "") & (records["quantity"] != 0.0)]
@@ -308,6 +416,9 @@ def _active_trades(trade_records: pd.DataFrame) -> dict[object, pd.DataFrame]:
     if "instrument_id" in records.columns:
         records["instrument_id"] = records["instrument_id"].fillna("").astype(str)
         records = records[records["instrument_id"] != ""]
+    if "episode_id" not in records.columns:
+        records["episode_id"] = ""
+    records["episode_id"] = records["episode_id"].fillna("").astype(str)
     if "fee" not in records.columns:
         records["fee"] = 0.0
     records["fee"] = pd.to_numeric(records["fee"], errors="coerce").fillna(0.0)
@@ -324,6 +435,21 @@ def _etf_positions(positions: pd.DataFrame) -> pd.DataFrame:
     if positions.empty:
         return positions
     return positions[positions["instrument_type"].astype(str).str.lower().eq("etf")].copy()
+
+
+def _episode_ids(positions: pd.DataFrame, trades: pd.DataFrame) -> set[str]:
+    episode_ids: set[str] = set()
+    for frame in (positions, trades):
+        if frame.empty or "episode_id" not in frame.columns:
+            continue
+        episode_ids.update(value for value in frame["episode_id"].fillna("").astype(str).tolist() if value)
+    return episode_ids
+
+
+def _filter_episode(frame: pd.DataFrame, episode_id: str) -> pd.DataFrame:
+    if frame.empty or "episode_id" not in frame.columns:
+        return frame.iloc[0:0].copy()
+    return frame[frame["episode_id"].fillna("").astype(str).eq(episode_id)].copy()
 
 
 def _option_exposures(

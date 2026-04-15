@@ -1,0 +1,108 @@
+{
+  "common": {
+    "annual_trading_days": 252,
+    "strategy_tag": "gamma_scalping"
+  },
+  "data": {
+    "data_root": "data",
+    "etf_subdir": "etf",
+    "opt_subdir": "opt",
+    "underlying": "510050.XSHG",
+    "start_date": null,
+    "end_date": null,
+    "frequency": "1d",
+    "price_policy": "mid_first",
+    "missing_data_policy": "skip",
+    "parquet_cache_size": 512
+  },
+  "greeks": {
+    "risk_free_rate": 0.0,
+    "dividend_rate": 0.0,
+    "annual_trading_days": 252,
+    "backend": "py_vollib_vectorized",
+    "allow_fallback": true
+  },
+  "volatility": {
+    "risk_free_rate": 0.0,
+    "dividend_rate": 0.0,
+    "annual_trading_days": 252,
+    "hv_windows": [10, 20, 60],
+    "iv_price_column": "mid",
+    "iv_fallback_price_column": "last",
+    "iv_backend": "py_vollib_vectorized",
+    "iv_bisection_lower": 0.0001,
+    "iv_bisection_upper": 5.0,
+    "iv_bisection_tolerance": 1e-8,
+    "iv_bisection_max_iterations": 100,
+    "vol_filter_calibration_mode": "walk_forward",
+    "rv_reference_mode": "current_hv",
+    "rv_reference_hv_column": "hv_20",
+    "rv_distribution_lookback_days": 252,
+    "rv_distribution_min_observations": 60,
+    "rv_distribution_quantile": 0.5
+  },
+  "atm_iv": {
+    "min_ttm_days": 5,
+    "max_ttm_days": 20,
+    "option_types": ["C", "P"],
+    "per_maturity_atm_only": true,
+    "aggregation": "mean",
+    "allow_single_side": true
+  },
+  "strategy": {
+    "min_ttm_days": 5,
+    "max_ttm_days": 20,
+    "target_ttm_days": 10,
+    "max_open_positions": 1,
+    "premium_budget_pct": 0.1,
+    "delta_threshold_pct": 0.01,
+    "min_option_volume": 1,
+    "min_open_interest": 0,
+    "max_spread_pct": 0.5,
+    "min_option_price": 0.0001,
+    "max_holding_days": null,
+    "use_vol_filter": false,
+    "min_hv_iv_edge": 0.0,
+    "entry_max_iv_rv_ratio": 0.9,
+    "exit_on_vol_edge_filled": false,
+    "exit_max_rv_iv_edge": 0.0,
+    "exit_min_iv_rv_ratio": 1.0,
+    "exit_iv_reference_mode": "position_average_iv",
+    "strategy_tag": "gamma_scalping",
+    "underlying_instrument_id": "510050.XSHG"
+  },
+  "execution": {
+    "etf_slippage_bps": 0.0,
+    "option_slippage_bps": 0.0,
+    "etf_fee_bps": 0.0,
+    "option_fee_per_contract": 0.0,
+    "option_fee_bps": 0.0
+  },
+  "risk": {
+    "max_abs_order_quantity": null
+  },
+  "backtest": {
+    "initial_cash": 1000000.0,
+    "strategy_tag": "gamma_scalping",
+    "output_dir": "results",
+    "run_id": null,
+    "position_zero_tolerance": 1e-12
+  },
+  "attribution": {
+    "exposure_mode": "previous_close",
+    "residual_warning_threshold": 0.1,
+    "eps": 1e-8
+  },
+  "performance": {
+    "annual_trading_days": 252,
+    "risk_free_rate": 0.0,
+    "var_level": 0.05,
+    "iv_hv_capture_denominator_eps": 1e-8,
+    "iv_hv_capture_min_return_observations": 2
+  },
+  "report": {
+    "enabled": true,
+    "output_dir": null,
+    "matplotlib_config_dir": "/tmp/matplotlib"
+  }
+}
