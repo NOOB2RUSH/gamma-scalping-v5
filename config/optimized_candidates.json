@@ -1,0 +1,73 @@
+{
+  "source_study": "results/optimization/vol_entry_refine_best_2018_2025",
+  "data_range": {
+    "start_date": "2018-01-01",
+    "end_date": "2025-12-31"
+  },
+  "candidates": {
+    "return_focus_trial_000309": {
+      "description": "收益优先候选；局部加密扫描中年化收益最高，也是综合评分推荐组合。",
+      "metrics": {
+        "annual_return": 0.0363,
+        "sharpe_ratio": 0.5810,
+        "sortino_ratio": 1.8394,
+        "max_drawdown": -0.063727,
+        "total_pnl": 293038.81,
+        "episode_count": 69,
+        "turnover": 212.360202
+      },
+      "params": {
+        "data.start_date": "2018-01-01",
+        "data.end_date": "2025-12-31",
+        "strategy.use_vol_filter": true,
+        "strategy.max_open_positions": 1,
+        "strategy.premium_budget_pct": 0.05,
+        "strategy.delta_threshold_pct": 0.005,
+        "strategy.entry_max_iv_rv_ratio": 0.875,
+        "strategy.min_hv_iv_edge": 0.0,
+        "strategy.exit_on_vol_edge_filled": true,
+        "strategy.exit_max_rv_iv_edge": 0.0,
+        "strategy.exit_min_iv_rv_ratio": 1.0,
+        "strategy.exit_iv_reference_mode": "position_average_iv",
+        "volatility.hv_windows": [10, 20, 60],
+        "volatility.rv_reference_mode": "max_current_and_quantile",
+        "volatility.rv_reference_hv_column": "hv_20",
+        "volatility.rv_distribution_lookback_days": 630,
+        "volatility.rv_distribution_min_observations": 120,
+        "volatility.rv_distribution_quantile": 0.5
+      }
+    },
+    "sharpe_focus_trial_000025": {
+      "description": "风险调整收益优先候选；局部加密扫描中夏普最高、回撤最低。",
+      "metrics": {
+        "annual_return": 0.0240,
+        "sharpe_ratio": 0.6622,
+        "sortino_ratio": 2.2477,
+        "max_drawdown": -0.039098,
+        "total_pnl": 186648.04,
+        "episode_count": 26,
+        "turnover": 98.442766
+      },
+      "params": {
+        "data.start_date": "2018-01-01",
+        "data.end_date": "2025-12-31",
+        "strategy.use_vol_filter": true,
+        "strategy.max_open_positions": 1,
+        "strategy.premium_budget_pct": 0.05,
+        "strategy.delta_threshold_pct": 0.005,
+        "strategy.entry_max_iv_rv_ratio": 0.825,
+        "strategy.min_hv_iv_edge": 0.0,
+        "strategy.exit_on_vol_edge_filled": true,
+        "strategy.exit_max_rv_iv_edge": 0.0,
+        "strategy.exit_min_iv_rv_ratio": 1.0,
+        "strategy.exit_iv_reference_mode": "position_average_iv",
+        "volatility.hv_windows": [10, 20, 60],
+        "volatility.rv_reference_mode": "rolling_quantile",
+        "volatility.rv_reference_hv_column": "hv_20",
+        "volatility.rv_distribution_lookback_days": 378,
+        "volatility.rv_distribution_min_observations": 120,
+        "volatility.rv_distribution_quantile": 0.55
+      }
+    }
+  }
+}

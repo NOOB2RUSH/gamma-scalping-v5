@@ -44,7 +44,7 @@ Data Loader
 | 波动率计算 | 计算历史波动率、隐含波动率、期限结构与波动率特征 | `VolSurfaceSnapshot`、`VolSignal` |
 | 策略逻辑 | 选择期权组合、计算 delta 对冲、生成调仓信号 | `TargetPortfolio`、`OrderIntent` |
 | 回测引擎 | 事件循环、成交、费用、保证金、持仓、PnL 归因 | `BacktestResult` |
-| Greeks 收益归因验证 | 将账户实际 PnL 拆解为 Delta/Gamma/Theta/Vega/对冲/成本/残差 | `AttributionResult`、归因 CSV |
+| Greeks 收益归因验证 | 将账户实际 PnL 拆解为 Delta/Gamma/Theta/Vega/对冲/成本/残差，并输出市场价、模型价、Greeks 近似之间的价格链路诊断 | `AttributionResult`、`PricingReconciliationResult`、归因 CSV |
 | 绩效分析与可视化 | 统计收益风险指标、绘图、导出报告 | `PerformanceReport` |
 | 参数调优 | 批量运行参数网格、约束筛选、稳健性评估 | `OptimizationResult` |
 
@@ -78,6 +78,7 @@ Gamma scalping 的研究假设：
 - 当 `dividend_rate != 0` 时，Greeks 计算不得调用 `py_vollib_vectorized` 的 Black-Scholes-Merton 后端，必须切换到本地 Black-Scholes-Merton fallback，直到第三方库 BSM rho 口径通过验证。
 - 回测引擎负责账户、成交、费用和持仓状态，不内嵌具体策略规则。
 - Greeks 收益归因验证模块只消费回测、Greeks、IV 和标的行情的标准输出，不重新运行回测，也不在可视化层重算归因。
+- Greeks 归因残差不得默认归咎于高阶 Greeks。当前诊断口径要求优先拆分 `market_model_basis_pnl` 和 `taylor_residual_pnl`，用来区分市场盯市价与 BSM 模型价差异、日频 previous-close 泰勒近似误差和真正的未解释高阶项。
 - 策略模块只输出目标组合或订单意图，不直接修改回测账户。
 - IV/HV 捕获率依赖显式 episode 生命周期。`episode_id` 必须从策略订单、成交、持仓、归因到绩效模块全链路透传；绩效模块不得从持仓断点反推开平仓周期。
 - 参数调优通过统一配置驱动回测，不复制策略代码。

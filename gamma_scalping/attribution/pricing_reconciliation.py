@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 
 import pandas as pd
 
 from gamma_scalping.export_format import format_for_csv
+from gamma_scalping.greeks import GreeksCalculator, GreeksConfig
 
 
 DETAIL_COLUMNS = [
@@ -24,6 +26,10 @@ DETAIL_COLUMNS = [
     "vega_pnl",
     "greeks_explained_pnl",
     "model_repricing_pnl",
+    "model_spot_pnl",
+    "model_theta_pnl",
+    "model_vega_pnl",
+    "model_cross_residual_pnl",
     "market_model_basis_pnl",
     "taylor_residual_pnl",
     "mark_residual_pnl",
@@ -38,6 +44,10 @@ DAILY_COLUMNS = [
     "mark_pnl",
     "greeks_explained_pnl",
     "model_repricing_pnl",
+    "model_spot_pnl",
+    "model_theta_pnl",
+    "model_vega_pnl",
+    "model_cross_residual_pnl",
     "market_model_basis_pnl",
     "taylor_residual_pnl",
     "mark_residual_pnl",
@@ -47,6 +57,13 @@ DAILY_COLUMNS = [
     "detail_count",
     "missing_flags",
 ]
+
+
+@dataclass(frozen=True)
+class PricingReconciliationConfig:
+    risk_free_rate: float = 0.0
+    dividend_rate: float = 0.0
+    annual_trading_days: int = 252
 
 
 @dataclass(frozen=True)
@@ -67,6 +84,17 @@ class PricingReconciliationResult:
 
 
 class PricingReconciliation:
+    def __init__(self, config: PricingReconciliationConfig | None = None) -> None:
+        self.config = config or PricingReconciliationConfig()
+        self._calculator = GreeksCalculator(
+            GreeksConfig(
+                risk_free_rate=self.config.risk_free_rate,
+                dividend_rate=self.config.dividend_rate,
+                annual_trading_days=self.config.annual_trading_days,
+                backend="black_scholes",
+            )
+        )
+
     def reconcile(
         self,
         *,
@@ -164,15 +192,19 @@ class PricingReconciliation:
                     underlying_by_date=underlying_by_date,
                 )
                 flags.extend(greeks.pop("flags"))
-                model_repricing = _model_repricing_pnl(
+                model_components = _model_repricing_components(
                     instrument_id=instrument_id,
                     prev_date=prev_date,
                     trading_date=trading_date,
                     quantity=quantity,
                     multiplier=multiplier,
                     greeks_by_key=greeks_by_key,
+                    iv_by_key=iv_by_key,
+                    underlying_by_date=underlying_by_date,
+                    calculator=self._calculator,
                     flags=flags,
                 )
+                model_repricing = model_components["model_repricing_pnl"]
             elif instrument_type == "etf":
                 greeks = _etf_pnl(
                     prev_date=prev_date,
@@ -182,10 +214,18 @@ class PricingReconciliation:
                 )
                 flags.extend(greeks.pop("flags"))
                 model_repricing = greeks["delta_pnl"]
+                model_components = {
+                    "model_repricing_pnl": model_repricing,
+                    "model_spot_pnl": model_repricing,
+                    "model_theta_pnl": 0.0,
+                    "model_vega_pnl": 0.0,
+                    "model_cross_residual_pnl": 0.0,
+                }
             else:
                 greeks = _zero_greeks()
                 flags.append("unsupported_instrument_type")
                 model_repricing = 0.0
+                model_components = _zero_model_components()
 
             greeks_explained = sum(greeks.values())
             market_model_basis = mark_pnl - model_repricing
@@ -213,6 +253,10 @@ class PricingReconciliation:
                     "vega_pnl": greeks["vega_pnl"],
                     "greeks_explained_pnl": greeks_explained,
                     "model_repricing_pnl": model_repricing,
+                    "model_spot_pnl": model_components["model_spot_pnl"],
+                    "model_theta_pnl": model_components["model_theta_pnl"],
+                    "model_vega_pnl": model_components["model_vega_pnl"],
+                    "model_cross_residual_pnl": model_components["model_cross_residual_pnl"],
                     "market_model_basis_pnl": market_model_basis,
                     "taylor_residual_pnl": taylor_residual,
                     "mark_residual_pnl": mark_pnl - greeks_explained,
@@ -240,6 +284,9 @@ def _greeks_pnl(
     if (prev_date, instrument_id) not in greeks_by_key.index:
         return {**_zero_greeks(), "flags": ["missing_greeks"]}
     greek = greeks_by_key.loc[(prev_date, instrument_id)]
+    is_expired = _is_contract_expired(instrument_id, trading_date, greeks_by_key)
+    if is_expired:
+        flags.append("option_expired")
     spot_prev = _spot(underlying_by_date, prev_date)
     spot = _spot(underlying_by_date, trading_date)
     if pd.isna(spot_prev) or pd.isna(spot):
@@ -256,11 +303,12 @@ def _greeks_pnl(
     if any(pd.isna(value) for value in [delta, gamma, theta, vega]):
         flags.append("missing_greeks")
     iv_change = _iv_change(iv_by_key, prev_date, trading_date, instrument_id, flags)
+    calendar_gap = (trading_date - prev_date).days
     return {
         "delta_pnl": 0.0 if pd.isna(delta) else delta * scale * d_spot,
-        "gamma_pnl": 0.0 if pd.isna(gamma) else 0.5 * gamma * scale * d_spot * d_spot,
-        "theta_pnl": 0.0 if pd.isna(theta) else theta * scale,
-        "vega_pnl": 0.0 if pd.isna(vega) or pd.isna(iv_change) else vega * scale * iv_change,
+        "gamma_pnl": 0.0 if pd.isna(gamma) or is_expired else 0.5 * gamma * scale * d_spot * d_spot,
+        "theta_pnl": 0.0 if pd.isna(theta) else theta * scale * calendar_gap,
+        "vega_pnl": 0.0 if pd.isna(vega) or pd.isna(iv_change) or is_expired else vega * scale * iv_change,
         "flags": flags,
     }
 
@@ -289,7 +337,7 @@ def _etf_pnl(
     }
 
 
-def _model_repricing_pnl(
+def _model_repricing_components(
     *,
     instrument_id: str,
     prev_date: object,
@@ -297,17 +345,52 @@ def _model_repricing_pnl(
     quantity: float,
     multiplier: float,
     greeks_by_key: pd.DataFrame,
+    iv_by_key: pd.DataFrame,
+    underlying_by_date: pd.DataFrame,
+    calculator: GreeksCalculator,
     flags: list[str],
-) -> float:
-    if (prev_date, instrument_id) not in greeks_by_key.index or (trading_date, instrument_id) not in greeks_by_key.index:
+) -> dict[str, float]:
+    zero = _zero_model_components()
+    if (prev_date, instrument_id) not in greeks_by_key.index:
         flags.append("missing_model_price")
-        return 0.0
-    prev_price = _to_float(greeks_by_key.loc[(prev_date, instrument_id)].get("theoretical_price"))
-    price = _to_float(greeks_by_key.loc[(trading_date, instrument_id)].get("theoretical_price"))
-    if pd.isna(prev_price) or pd.isna(price):
+        return zero
+
+    prev_row = greeks_by_key.loc[(prev_date, instrument_id)]
+    curr_row = greeks_by_key.loc[(trading_date, instrument_id)] if (trading_date, instrument_id) in greeks_by_key.index else None
+    spot_prev = _spot(underlying_by_date, prev_date)
+    spot = _spot(underlying_by_date, trading_date)
+    prev_iv = _row_iv(prev_row, iv_by_key, prev_date, instrument_id)
+    curr_iv = _row_iv(curr_row, iv_by_key, trading_date, instrument_id)
+    prev_price = _model_price(prev_row, spot_prev, prev_iv, calculator)
+    curr_price = _model_price(curr_row, spot, curr_iv, calculator) if curr_row is not None else float("nan")
+    if pd.isna(prev_price) or pd.isna(curr_price):
         flags.append("missing_model_price")
-        return 0.0
-    return quantity * multiplier * (price - prev_price)
+        return zero
+
+    scale = quantity * multiplier
+    model_repricing = scale * (curr_price - prev_price)
+    price_after_spot = _model_price(prev_row, spot, prev_iv, calculator)
+    price_after_time = _model_price(curr_row, spot, prev_iv, calculator)
+    if pd.isna(price_after_spot) or pd.isna(price_after_time):
+        flags.append("missing_model_decomposition")
+        return {
+            "model_repricing_pnl": model_repricing,
+            "model_spot_pnl": 0.0,
+            "model_theta_pnl": 0.0,
+            "model_vega_pnl": 0.0,
+            "model_cross_residual_pnl": model_repricing,
+        }
+
+    spot_pnl = scale * (price_after_spot - prev_price)
+    theta_pnl = scale * (price_after_time - price_after_spot)
+    vega_pnl = scale * (curr_price - price_after_time)
+    return {
+        "model_repricing_pnl": model_repricing,
+        "model_spot_pnl": spot_pnl,
+        "model_theta_pnl": theta_pnl,
+        "model_vega_pnl": vega_pnl,
+        "model_cross_residual_pnl": model_repricing - spot_pnl - theta_pnl - vega_pnl,
+    }
 
 
 def _trade_components(
@@ -359,6 +442,10 @@ def _daily_row(trading_date: object, detail: list[dict[str, object]], trades: pd
         "mark_pnl": sums["mark_pnl"],
         "greeks_explained_pnl": sums["greeks_explained_pnl"],
         "model_repricing_pnl": sums["model_repricing_pnl"],
+        "model_spot_pnl": sums["model_spot_pnl"],
+        "model_theta_pnl": sums["model_theta_pnl"],
+        "model_vega_pnl": sums["model_vega_pnl"],
+        "model_cross_residual_pnl": sums["model_cross_residual_pnl"],
         "market_model_basis_pnl": sums["market_model_basis_pnl"],
         "taylor_residual_pnl": sums["taylor_residual_pnl"],
         "mark_residual_pnl": sums["mark_residual_pnl"],
@@ -439,6 +526,13 @@ def _iv_change(iv_by_key: pd.DataFrame, prev_date: object, trading_date: object,
     return iv - prev_iv
 
 
+def _is_contract_expired(contract_id: str, trading_date: object, greeks_by_key: pd.DataFrame) -> bool:
+    if (trading_date, contract_id) not in greeks_by_key.index:
+        return True
+    delta = _to_float(greeks_by_key.loc[(trading_date, contract_id)].get("delta"))
+    return pd.isna(delta)
+
+
 def _spot(underlying_by_date: pd.DataFrame, trading_date: object) -> float:
     if trading_date not in underlying_by_date.index:
         return float("nan")
@@ -447,6 +541,51 @@ def _spot(underlying_by_date: pd.DataFrame, trading_date: object) -> float:
 
 def _zero_greeks() -> dict[str, float]:
     return {"delta_pnl": 0.0, "gamma_pnl": 0.0, "theta_pnl": 0.0, "vega_pnl": 0.0}
+
+
+def _zero_model_components() -> dict[str, float]:
+    return {
+        "model_repricing_pnl": 0.0,
+        "model_spot_pnl": 0.0,
+        "model_theta_pnl": 0.0,
+        "model_vega_pnl": 0.0,
+        "model_cross_residual_pnl": 0.0,
+    }
+
+
+def _row_iv(row: pd.Series | None, iv_by_key: pd.DataFrame, trading_date: object, contract_id: str) -> float:
+    if row is not None:
+        iv = _to_float(row.get("iv"))
+        if not pd.isna(iv):
+            return iv
+    if (trading_date, contract_id) not in iv_by_key.index:
+        return float("nan")
+    return _to_float(iv_by_key.loc[(trading_date, contract_id)].get("iv"))
+
+
+def _model_price(row: pd.Series | None, spot: float, sigma: float, calculator: GreeksCalculator) -> float:
+    if row is None or pd.isna(spot):
+        return float("nan")
+    option_type = str(row.get("option_type", "")).lower()
+    strike = _to_float(row.get("strike"))
+    ttm = _to_float(row.get("ttm_trading_days"))
+    if option_type not in {"c", "p"} or pd.isna(strike) or strike <= 0 or pd.isna(ttm):
+        return float("nan")
+    if ttm <= 0:
+        return _intrinsic_value(option_type, spot, strike)
+    if pd.isna(sigma) or sigma <= 0:
+        price = _to_float(row.get("theoretical_price"))
+        return price
+    try:
+        return calculator.price(option_type, spot, strike, int(round(ttm)), sigma)
+    except (ValueError, OverflowError, ZeroDivisionError):
+        return float("nan")
+
+
+def _intrinsic_value(option_type: str, spot: float, strike: float) -> float:
+    if option_type == "c":
+        return max(spot - strike, 0.0)
+    return max(strike - spot, 0.0)
 
 
 def _normalize_optional(frame: pd.DataFrame) -> pd.DataFrame:

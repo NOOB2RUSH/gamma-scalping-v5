@@ -313,6 +313,73 @@ def test_pricing_reconciliation_splits_mark_and_greeks_residual(tmp_path) -> Non
     assert paths["pricing_reconciliation_daily"].exists()
 
 
+def test_pricing_reconciliation_model_repricing_components_sum_to_model_pnl() -> None:
+    equity_curve = pd.DataFrame(
+        {
+            "trading_date": [date(2024, 4, 8), date(2024, 4, 9)],
+            "equity": [1000.0, 1000.0],
+        }
+    )
+    trade_records = pd.DataFrame(columns=["trading_date", "instrument_id", "episode_id", "side", "quantity", "price", "fee"])
+    position_records = pd.DataFrame(
+        {
+            "trading_date": [date(2024, 4, 8), date(2024, 4, 9)],
+            "instrument_id": ["CALL1", "CALL1"],
+            "instrument_type": ["option", "option"],
+            "quantity": [1.0, 1.0],
+            "multiplier": [100.0, 100.0],
+            "mark_price": [1.0, 1.2],
+            "episode_id": ["episode_1", "episode_1"],
+        }
+    )
+    greeks_history = pd.DataFrame(
+        {
+            "trading_date": [date(2024, 4, 8), date(2024, 4, 9)],
+            "contract_id": ["CALL1", "CALL1"],
+            "option_type": ["C", "C"],
+            "strike": [100.0, 100.0],
+            "ttm_trading_days": [10, 9],
+            "multiplier": [100.0, 100.0],
+            "delta": [0.5, 0.6],
+            "gamma": [0.01, 0.02],
+            "theta": [-0.1, -0.1],
+            "vega": [1.0, 1.1],
+            "iv": [0.20, 0.25],
+            "theoretical_price": [1.0, 1.2],
+            "greeks_status": ["ok", "ok"],
+        }
+    )
+    iv_history = pd.DataFrame(
+        {
+            "trading_date": [date(2024, 4, 8), date(2024, 4, 9)],
+            "contract_id": ["CALL1", "CALL1"],
+            "iv": [0.20, 0.25],
+            "iv_status": ["ok", "ok"],
+        }
+    )
+    underlying_history = pd.DataFrame(
+        {
+            "trading_date": [date(2024, 4, 8), date(2024, 4, 9)],
+            "underlying": ["510050.XSHG", "510050.XSHG"],
+            "close": [100.0, 101.0],
+        }
+    )
+
+    result = PricingReconciliation().reconcile(
+        equity_curve=equity_curve,
+        trade_records=trade_records,
+        position_records=position_records,
+        greeks_history=greeks_history,
+        iv_history=iv_history,
+        underlying_history=underlying_history,
+    )
+
+    row = result.detail.iloc[0]
+    component_sum = row["model_spot_pnl"] + row["model_theta_pnl"] + row["model_vega_pnl"] + row["model_cross_residual_pnl"]
+    assert row["model_repricing_pnl"] == pytest.approx(component_sum)
+    assert {"model_spot_pnl", "model_theta_pnl", "model_vega_pnl", "model_cross_residual_pnl"}.issubset(result.daily.columns)
+
+
 def test_unsupported_exposure_mode_fails_fast() -> None:
     with pytest.raises(ValueError, match="previous_close"):
         GreeksPnLAttribution(AttributionConfig(exposure_mode="average"))

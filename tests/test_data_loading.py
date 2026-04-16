@@ -8,6 +8,15 @@ import pytest
 from gamma_scalping.data import MarketDataConfig, MarketDataLoader, TradingCalendar
 
 
+def _fixture_config(**kwargs) -> MarketDataConfig:
+    return MarketDataConfig(
+        min_option_chain_rows=0,
+        min_option_chain_maturities=0,
+        require_option_call_put=False,
+        **kwargs,
+    )
+
+
 def _write_fixture_files(
     root,
     trading_date: str,
@@ -63,7 +72,7 @@ def test_calendar_skips_weekends_and_mainland_china_holidays() -> None:
 
 def test_loader_standardizes_snapshot_and_ttm(tmp_path) -> None:
     _write_fixture_files(tmp_path, "2024-04-08")
-    loader = MarketDataLoader(MarketDataConfig(data_root=tmp_path, start_date="2024-04-08", end_date="2024-04-08"))
+    loader = MarketDataLoader(_fixture_config(data_root=tmp_path, start_date="2024-04-08", end_date="2024-04-08"))
 
     dates = loader.list_trading_dates()
     snapshot = loader.load_snapshot(dates[0])
@@ -82,7 +91,7 @@ def test_loader_standardizes_snapshot_and_ttm(tmp_path) -> None:
 def test_loader_uses_configured_data_subdirs_and_cache_size(tmp_path, monkeypatch) -> None:
     _write_fixture_files(tmp_path, "2024-04-08", etf_subdir="custom_etf", opt_subdir="custom_opt")
     loader = MarketDataLoader(
-        MarketDataConfig(
+        _fixture_config(
             data_root=tmp_path,
             etf_subdir="custom_etf",
             opt_subdir="custom_opt",
@@ -110,7 +119,7 @@ def test_loader_uses_configured_data_subdirs_and_cache_size(tmp_path, monkeypatc
 
 def test_loader_falls_back_to_close_for_invalid_bid_ask(tmp_path) -> None:
     _write_fixture_files(tmp_path, "2024-04-08", invalid_bid_ask=True)
-    loader = MarketDataLoader(MarketDataConfig(data_root=tmp_path, start_date="2024-04-08", end_date="2024-04-08"))
+    loader = MarketDataLoader(_fixture_config(data_root=tmp_path, start_date="2024-04-08", end_date="2024-04-08"))
 
     chain = loader.load_option_chain(date(2024, 4, 8))
 
@@ -124,7 +133,7 @@ def test_loader_falls_back_to_close_for_invalid_bid_ask(tmp_path) -> None:
 def test_loader_supports_bid_ask_conservative_policy(tmp_path) -> None:
     _write_fixture_files(tmp_path, "2024-04-08")
     loader = MarketDataLoader(
-        MarketDataConfig(
+        _fixture_config(
             data_root=tmp_path,
             start_date="2024-04-08",
             end_date="2024-04-08",
@@ -154,3 +163,25 @@ def test_loader_missing_data_policy_error(tmp_path) -> None:
 
     with pytest.raises(FileNotFoundError):
         loader.list_trading_dates()
+
+
+def test_loader_skips_incomplete_option_chain_by_default(tmp_path) -> None:
+    _write_fixture_files(tmp_path, "2024-04-08")
+    loader = MarketDataLoader(MarketDataConfig(data_root=tmp_path, start_date="2024-04-08", end_date="2024-04-08"))
+
+    assert list(loader.iter_snapshots()) == []
+
+
+def test_loader_raises_for_incomplete_option_chain_when_policy_error(tmp_path) -> None:
+    _write_fixture_files(tmp_path, "2024-04-08")
+    loader = MarketDataLoader(
+        MarketDataConfig(
+            data_root=tmp_path,
+            start_date="2024-04-08",
+            end_date="2024-04-08",
+            missing_data_policy="error",
+        )
+    )
+
+    with pytest.raises(ValueError, match="Incomplete option chain"):
+        loader.load_snapshot(date(2024, 4, 8))

@@ -224,6 +224,57 @@ def test_portfolio_expiry_settlement_removes_option_position() -> None:
     assert "CALL_ATM" not in portfolio.holdings
 
 
+def test_portfolio_remaps_option_contract_id_by_economic_terms() -> None:
+    entry = _snapshot()
+    portfolio = Portfolio(initial_cash=10000)
+    portfolio.apply_fills(
+        ExecutionModel().fill(
+            (OrderIntent(entry.trading_date, "CALL_ATM", "option", "buy", 1, "test", "call_leg", episode_id="episode"),),
+            entry,
+        )
+    )
+    remapped = _snapshot(date(2024, 4, 9), ttm=9)
+    remapped_frame = remapped.option_chain.frame.copy()
+    remapped_frame.loc[remapped_frame["contract_id"].eq("CALL_ATM"), "contract_id"] = "CALL_RECODED"
+    remapped = MarketSnapshot(
+        trading_date=remapped.trading_date,
+        underlying=remapped.underlying,
+        etf_bar=remapped.etf_bar,
+        option_chain=OptionChain(remapped.trading_date, remapped.underlying, remapped_frame),
+    )
+
+    events = portfolio.remap_option_contract_ids(remapped)
+
+    assert events[0]["old_instrument_id"] == "CALL_ATM"
+    assert events[0]["new_instrument_id"] == "CALL_RECODED"
+    assert ("CALL_RECODED", "episode") in portfolio.holdings
+
+
+def test_portfolio_settles_expired_missing_option_from_holding_terms() -> None:
+    entry = _snapshot()
+    expiry = _snapshot(date(2024, 4, 22), ttm=0, spot=3.0)
+    expiry_frame = expiry.option_chain.frame[expiry.option_chain.frame["contract_id"].ne("CALL_ATM")].copy()
+    expiry = MarketSnapshot(
+        trading_date=expiry.trading_date,
+        underlying=expiry.underlying,
+        etf_bar=expiry.etf_bar,
+        option_chain=OptionChain(expiry.trading_date, expiry.underlying, expiry_frame),
+    )
+    portfolio = Portfolio(initial_cash=10000)
+    portfolio.apply_fills(
+        ExecutionModel().fill(
+            (OrderIntent(entry.trading_date, "CALL_ATM", "option", "buy", 1, "test", "call_leg"),),
+            entry,
+        )
+    )
+
+    events = portfolio.handle_expiry_and_settlement(expiry)
+
+    assert events[0]["event"] == "expiry_settlement"
+    assert events[0]["cash_flow"] == pytest.approx(2000)
+    assert "CALL_ATM" not in portfolio.holdings
+
+
 def test_backtest_closes_episode_hedge_after_expiry_settlement() -> None:
     snapshots = [_snapshot(date(2024, 4, 8), ttm=10), _snapshot(date(2024, 4, 22), ttm=0, spot=3.0)]
     engine = BacktestEngine(

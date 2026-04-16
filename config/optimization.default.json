@@ -1,0 +1,45 @@
+{
+  "study": {
+    "study_id": "gamma_scalping_opt",
+    "output_dir": "results/optimization",
+    "base_config": "config/backtest.default.json",
+    "workers": 16,
+    "resume": true,
+    "max_trials": null,
+    "diagnostics": false,
+    "save_trial_outputs": false,
+    "cache_market_calculations": true,
+    "write_results_every": 50,
+    "prewarm_market_cache": true
+  },
+  "data_splits": [
+    {
+      "name": "full_2018_2025",
+      "start_date": "2018-01-01",
+      "end_date": "2025-12-31"
+    }
+  ],
+  "parameters": {
+    "strategy.use_vol_filter": [true],
+    "strategy.max_open_positions": [1],
+    "strategy.premium_budget_pct": [0.05, 0.1],
+    "strategy.delta_threshold_pct": [0.005, 0.01],
+    "volatility.rv_reference_mode": ["current_hv", "rolling_quantile"],
+    "volatility.rv_reference_hv_column": ["hv_20"],
+    "volatility.rv_distribution_quantile": [0.5],
+    "strategy.entry_max_iv_rv_ratio": [0.8, 0.85, 0.9, 0.95],
+    "strategy.min_hv_iv_edge": [0.0, 0.01, 0.02],
+    "strategy.exit_on_vol_edge_filled": [false, true],
+    "strategy.exit_max_rv_iv_edge": [0.0],
+    "strategy.exit_min_iv_rv_ratio": [1.0],
+    "strategy.exit_iv_reference_mode": ["position_average_iv"]
+  },
+  "objective": {
+    "primary": "score",
+    "constraints": {
+      "episode_count_min": 20,
+      "max_drawdown_min": -0.2,
+      "gamma_theta_pnl_min": 0.0
+    }
+  }
+}

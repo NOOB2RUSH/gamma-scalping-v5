@@ -188,6 +188,18 @@ class GammaScalpingStrategy:
                 if (snapshot.trading_date - position.entry_trading_date).days >= self.config.max_holding_days:
                     risk_flags.append("max_holding_days")
 
+        if "missing_contract" in risk_flags:
+            episode_ids = tuple(sorted({position.episode_id for position in existing_options if position.episode_id}))
+            return StrategyDecision(
+                trading_date=snapshot.trading_date,
+                action="hold",
+                order_intents=(),
+                selected_contracts=tuple(position.instrument_id for position in existing_options),
+                reason="missing_contract_quote_skip",
+                risk_flags=tuple(sorted(set(risk_flags))),
+                episode_id=episode_ids[0] if len(episode_ids) == 1 else "",
+            )
+
         if not risk_flags:
             vol_exit = self._maybe_vol_exit(snapshot, greeks_by_contract, vol_signal, portfolio, existing_options)
             if vol_exit is not None:

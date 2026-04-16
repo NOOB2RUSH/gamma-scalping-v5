@@ -22,6 +22,10 @@ class Holding:
     strategy_tag: str = "gamma_scalping"
     entry_trading_date: object | None = None
     episode_id: str = ""
+    strike: float | None = None
+    option_type: str = ""
+    maturity_date: object | None = None
+    maturity_session: object | None = None
 
 
 class Portfolio:
@@ -72,11 +76,14 @@ class Portfolio:
             if holding.instrument_type != "option" or holding.quantity == 0:
                 continue
             if holding.instrument_id not in option_frame.index:
-                continue
-            row = option_frame.loc[holding.instrument_id]
-            if int(row.get("ttm_trading_days", 1)) > 0:
-                continue
-            payoff = self._option_payoff(row, snapshot.etf_bar.close) * holding.multiplier * holding.quantity
+                if not self._holding_is_expired(holding, snapshot):
+                    continue
+                payoff = self._holding_option_payoff(holding, snapshot.etf_bar.close) * holding.multiplier * holding.quantity
+            else:
+                row = option_frame.loc[holding.instrument_id]
+                if int(row.get("ttm_trading_days", 1)) > 0:
+                    continue
+                payoff = self._option_payoff(row, snapshot.etf_bar.close) * holding.multiplier * holding.quantity
             self.cash += payoff
             self.realized_pnl += payoff - holding.avg_price * holding.multiplier * holding.quantity
             events.append(
@@ -89,6 +96,36 @@ class Portfolio:
                 }
             )
             del self.holdings[key]
+        return events
+
+    def remap_option_contract_ids(self, snapshot: MarketSnapshot) -> list[dict[str, object]]:
+        option_frame = snapshot.option_chain.frame
+        existing_ids = set(option_frame["contract_id"].astype(str))
+        events = []
+        for key, holding in list(self.holdings.items()):
+            if holding.instrument_type != "option" or holding.instrument_id in existing_ids:
+                continue
+            match = self._matching_option_row(holding, option_frame)
+            if match is None:
+                continue
+            old_instrument_id = holding.instrument_id
+            new_instrument_id = str(match["contract_id"])
+            del self.holdings[key]
+            holding.instrument_id = new_instrument_id
+            holding.strike = float(match["strike"]) if not pd.isna(match["strike"]) else holding.strike
+            holding.option_type = str(match["option_type"])
+            holding.maturity_date = match.get("maturity_date")
+            holding.maturity_session = match.get("maturity_session")
+            self.holdings[self._holding_key(new_instrument_id, holding.episode_id)] = holding
+            events.append(
+                {
+                    "trading_date": snapshot.trading_date,
+                    "old_instrument_id": old_instrument_id,
+                    "new_instrument_id": new_instrument_id,
+                    "episode_id": holding.episode_id,
+                    "event": "option_contract_remap",
+                }
+            )
         return events
 
     def market_value(self, snapshot: MarketSnapshot) -> float:
@@ -162,6 +199,10 @@ class Portfolio:
                 strategy_tag=self.strategy_tag,
                 entry_trading_date=fill.trading_date,
                 episode_id=fill.episode_id,
+                strike=fill.strike,
+                option_type=fill.option_type,
+                maturity_date=fill.maturity_date,
+                maturity_session=fill.maturity_session,
             )
             return
 
@@ -185,6 +226,35 @@ class Portfolio:
         if str(row["option_type"]).upper() == "C":
             return max(spot - float(row["strike"]), 0.0)
         return max(float(row["strike"]) - spot, 0.0)
+
+    @staticmethod
+    def _holding_option_payoff(holding: Holding, spot: float) -> float:
+        if holding.strike is None:
+            return 0.0
+        if str(holding.option_type).upper() == "C":
+            return max(spot - float(holding.strike), 0.0)
+        return max(float(holding.strike) - spot, 0.0)
+
+    @staticmethod
+    def _holding_is_expired(holding: Holding, snapshot: MarketSnapshot) -> bool:
+        expiry = holding.maturity_session or holding.maturity_date
+        return expiry is not None and expiry <= snapshot.trading_date
+
+    @staticmethod
+    def _matching_option_row(holding: Holding, option_frame: pd.DataFrame) -> pd.Series | None:
+        if holding.strike is None or not holding.option_type or holding.maturity_date is None:
+            return None
+        strike = pd.to_numeric(option_frame["strike"], errors="coerce")
+        option_type_match = option_frame["option_type"].astype(str).str.upper().eq(str(holding.option_type).upper())
+        strike_match = (strike - float(holding.strike)).abs() < 1e-8
+        candidates = option_frame[option_type_match & option_frame["maturity_date"].eq(holding.maturity_date) & strike_match]
+        if candidates.empty and holding.maturity_session is not None:
+            candidates = option_frame[
+                option_type_match & option_frame["maturity_session"].eq(holding.maturity_session) & strike_match
+            ]
+        if candidates.empty:
+            return None
+        return candidates.iloc[0]
 
     def _position_record(
         self,

@@ -26,6 +26,7 @@ class BacktestConfig:
     output_dir: Path | str | None = None
     run_id: str | None = None
     position_zero_tolerance: float = 1e-12
+    collect_market_history: bool = True
 
 
 @dataclass(frozen=True)
@@ -97,7 +98,12 @@ class BacktestEngine:
         self.atm_iv_config = atm_iv_config or AtmIvConfig()
         self.config = config or BacktestConfig()
 
-    def run(self, snapshots: Iterable[MarketSnapshot], etf_history: pd.DataFrame | None = None) -> BacktestResult:
+    def run(
+        self,
+        snapshots: Iterable[MarketSnapshot],
+        etf_history: pd.DataFrame | None = None,
+        market_cache: dict[object, tuple[pd.DataFrame, pd.DataFrame]] | None = None,
+    ) -> BacktestResult:
         snapshots = list(snapshots)
         run_id = self._run_id(snapshots)
         if not snapshots:
@@ -140,7 +146,22 @@ class BacktestEngine:
             expiry_hedge_fills = self._close_expired_hedges(expiry_events, portfolio, snapshot)
             fill_rows.extend(fill.__dict__ for fill in expiry_hedge_fills)
             self._update_expired_episodes(episode_registry, expiry_events, snapshot.trading_date)
-            surface = self.volatility_engine.solve_iv_chain(snapshot)
+            expiry_rows.extend(portfolio.remap_option_contract_ids(snapshot))
+            cached_market = market_cache.get(snapshot.trading_date) if market_cache is not None else None
+            if cached_market is None:
+                surface = self.volatility_engine.solve_iv_chain(snapshot)
+                greeks = self.greeks_calculator.enrich_chain(
+                    snapshot.option_chain,
+                    spot=snapshot.etf_bar.close,
+                    sigma=surface.set_index("contract_id")["iv"],
+                )
+                greeks = greeks.drop(columns=["iv", "iv_status"], errors="ignore").merge(
+                    surface[["contract_id", "iv", "iv_status"]],
+                    on="contract_id",
+                    how="left",
+                )
+            else:
+                surface, greeks = cached_market
             vol_signal = self.volatility_engine.build_signal(
                 surface,
                 row_for_date(hv, snapshot.trading_date),
@@ -149,18 +170,9 @@ class BacktestEngine:
                 underlying=snapshot.underlying,
                 hv_history=hv,
             )
-            greeks = self.greeks_calculator.enrich_chain(
-                snapshot.option_chain,
-                spot=snapshot.etf_bar.close,
-                sigma=surface.set_index("contract_id")["iv"],
-            )
-            greeks = greeks.drop(columns=["iv", "iv_status"], errors="ignore").merge(
-                surface[["contract_id", "iv", "iv_status"]],
-                on="contract_id",
-                how="left",
-            )
-            greeks_history_rows.extend(self._greeks_history_rows(snapshot, greeks))
-            iv_history_rows.extend(self._iv_history_rows(snapshot, surface))
+            if self.config.collect_market_history:
+                greeks_history_rows.extend(self._greeks_history_rows(snapshot, greeks))
+                iv_history_rows.extend(self._iv_history_rows(snapshot, surface))
             mtm_before_decision = portfolio.mark_to_market(snapshot)
             decision = self.strategy.on_snapshot(snapshot, greeks, vol_signal, portfolio.to_strategy_state(snapshot))
             checked_orders = self.risk_checker.check(decision.order_intents, snapshot)

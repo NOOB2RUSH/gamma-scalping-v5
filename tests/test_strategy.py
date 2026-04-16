@@ -265,6 +265,26 @@ def test_strategy_closes_on_expired_or_bad_quality_position() -> None:
     ]
 
 
+def test_strategy_skips_close_when_position_quote_is_missing() -> None:
+    strategy = GammaScalpingStrategy()
+    episode_id = "episode"
+    portfolio = PortfolioState(
+        equity=100000,
+        positions=(
+            StrategyPosition("CALL_MISSING", "option", quantity=1, multiplier=10000, role="call_leg", episode_id=episode_id),
+            StrategyPosition("PUT_ATM", "option", quantity=1, multiplier=10000, role="put_leg", episode_id=episode_id),
+        ),
+    )
+
+    decision = strategy.on_snapshot(_snapshot(), _greeks_frame(ttm=0), _vol_signal(), portfolio)
+
+    assert decision.action == "hold"
+    assert decision.reason == "missing_contract_quote_skip"
+    assert "missing_contract" in decision.risk_flags
+    assert decision.order_intents == ()
+    assert decision.episode_id == episode_id
+
+
 def test_strategy_vol_filter_placeholder_can_block_entry() -> None:
     strategy = GammaScalpingStrategy(StrategyConfig(use_vol_filter=True, min_hv_iv_edge=0.05))
 

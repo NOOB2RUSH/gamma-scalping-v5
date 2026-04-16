@@ -21,6 +21,10 @@ class Fill:
     reason: str
     role: str = ""
     episode_id: str = ""
+    strike: float | None = None
+    option_type: str = ""
+    maturity_date: object | None = None
+    maturity_session: object | None = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,10 @@ class ExecutionModel:
         for order in orders:
             if order.quantity <= 0:
                 continue
+            strike = None
+            option_type = ""
+            maturity_date = None
+            maturity_session = None
             if order.instrument_type == "etf":
                 price = self._etf_price(snapshot.etf_bar.close, order.side)
                 multiplier = 1.0
@@ -52,6 +60,10 @@ class ExecutionModel:
                 multiplier = float(row["multiplier"])
                 notional = order.quantity * price * multiplier
                 fee = order.quantity * self.option_fee_per_contract + notional * self.option_fee_bps / 10000.0
+                strike = float(row["strike"]) if "strike" in row and not pd.isna(row["strike"]) else None
+                option_type = str(row.get("option_type", ""))
+                maturity_date = row.get("maturity_date")
+                maturity_session = row.get("maturity_session")
             else:
                 raise ValueError(f"Unsupported instrument_type: {order.instrument_type}")
             fills.append(
@@ -67,6 +79,10 @@ class ExecutionModel:
                     reason=order.reason,
                     role=order.role,
                     episode_id=order.episode_id,
+                    strike=strike if order.instrument_type == "option" else None,
+                    option_type=option_type if order.instrument_type == "option" else "",
+                    maturity_date=maturity_date if order.instrument_type == "option" else None,
+                    maturity_session=maturity_session if order.instrument_type == "option" else None,
                 )
             )
         return tuple(fills)
